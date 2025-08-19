@@ -827,8 +827,8 @@ local RankData = {
         primary = Color3.fromRGB(20, 20, 20),
         AnimateName = false,
         JumpLetters = false,
-        GlitchName = false,
-        UseImage = false,
+        GlitchName = true,
+        UseImage = true,
         accent = Color3.fromRGB(255, 105, 180),
         emoji = "",
         image = "http://www.roblox.com/asset/?id=10111107788"
