@@ -110,7 +110,7 @@ local tagOrder = {
     "ErtisHub NIGGER",
     "ErtisHub LOCKED",
     "ErtisHub BIBS",
-    "ErtisHub BiggestGay"
+    "ErtisHub BIGGESTGAY"
 }
 
 
@@ -823,7 +823,7 @@ local RankData = {
         emoji = "",
         image = "http://www.roblox.com/asset/?id=84422083508078"
     },
-    ["ErtisHub BiggestGay"] = {
+    ["ErtisHub BIGGESTGAY"] = {
         primary = Color3.fromRGB(20, 20, 20),
         AnimateName = false,
         JumpLetters = true,
@@ -831,7 +831,7 @@ local RankData = {
         UseImage = true,
         accent = Color3.fromRGB(255, 105, 180),
         emoji = "",
-        image = "http://www.roblox.com/asset/?id=10111107788"
+        image = "http://www.roblox.com/asset/?id=10111107769"
     },
 }
 
