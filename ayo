@@ -1,6 +1,7 @@
 -- =============================================
 --       NAMETAG SYSTEM v8.2 - Dark Theme
 --       Standalone file - load via HttpGet
+--       FIXED: ;char / morph command support
 -- =============================================
 
 local S = {
@@ -363,12 +364,12 @@ local function destroyTag(player)
     tags[player] = nil
 end
 
-local function createTag(player)
+local function createTag(player, charOverride)
     if not enabled  then return end
     if player == LP then return end
     local d = tags[player]
     if not d then return end
-    local ch   = player.Character
+    local ch   = charOverride or player.Character
     local head = ch and ch:FindFirstChild("Head")
     if not head then return end
     destroyTagUI(player)
@@ -378,16 +379,39 @@ local function createTag(player)
     d.heartbeat = hb
 end
 
+-- =============================================
+--   FIXED: setupPlayer z obsługą ;char / morphów
+-- =============================================
 local function setupPlayer(player)
     if player == LP then return end
     tags[player] = { refs = nil, heartbeat = nil, charConn = nil, overlapTrans = 0 }
     local d = tags[player]
-    d.charConn = player.CharacterAdded:Connect(function()
-        task.wait()
-        if player.Character then player.Character:WaitForChild("Head", 10) end
-        createTag(player)
+
+    d.charConn = player.CharacterAdded:Connect(function(newChar)
+        -- Poczekaj aż Head i Humanoid będą gotowe (ważne przy ;char / morphach)
+        local head = newChar:WaitForChild("Head", 10)
+        if not head then return end
+
+        local hum = newChar:WaitForChild("Humanoid", 10)
+        if not hum then return end
+
+        -- Zniszcz stary nametag zanim zbudujesz nowy
+        destroyTagUI(player)
+
+        -- task.defer odczekuje aż silnik przetworzy bieżący frame
+        -- dzięki temu nowa postać jest w pełni załadowana
+        task.defer(function()
+            -- Sprawdź czy gracz nadal jest w grze i ma tę samą postać
+            if not tags[player] then return end
+            if player.Character ~= newChar then return end
+            createTag(player, newChar)
+        end)
     end)
-    if player.Character then createTag(player) end
+
+    -- Obsługa sytuacji gdy postać już istnieje przy dołączeniu gracza
+    if player.Character then
+        createTag(player, player.Character)
+    end
 end
 
 -- Globalne API (dostępne z głównego skryptu przez getgenv())
