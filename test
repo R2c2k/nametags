@@ -1,15 +1,16 @@
 -- =============================================
---       NAMETAG SYSTEM v10.0 - Dark Theme
+--       NAMETAG SYSTEM v11.0 - Dark Theme
 --       Standalone file - load via HttpGet
---       FIX: ;char polling fallback (HD Admin)
---       FIX: AncestryChanged + token system
+--       FIX: Head.Locked=true (HD Admin)
+--            BillboardGui -> CoreGui zamiast Head
 -- =============================================
 
 local S = {
-    Players = game:GetService("Players"),
-    Run     = game:GetService("RunService"),
-    Text    = game:GetService("TextService"),
-    Camera  = workspace.CurrentCamera,
+    Players   = game:GetService("Players"),
+    Run       = game:GetService("RunService"),
+    Text      = game:GetService("TextService"),
+    Camera    = workspace.CurrentCamera,
+    CoreGui   = game:GetService("CoreGui"),
 }
 local LP = S.Players.LocalPlayer
 
@@ -53,6 +54,12 @@ local enabled     = false
 local accentColor = C.Accent
 local tags        = {}
 local globalLoop  = nil
+
+-- Kontener dla wszystkich BillboardGui — poza Head, poza workspace
+-- CoreGui jest zawsze dostępny i nie jest blokowany przez HD Admin
+local tagContainer = Instance.new("Folder")
+tagContainer.Name   = "NametagContainer"
+tagContainer.Parent = S.CoreGui
 
 -- ─────────────────────────────────────────────
 --   Utility
@@ -127,6 +134,8 @@ end
 
 -- ─────────────────────────────────────────────
 --   UI Builder
+--   KLUCZOWA ZMIANA: bb.Parent = tagContainer
+--   bb.Adornee = head  (nie parent!)
 -- ─────────────────────────────────────────────
 
 local function buildUI(player, head)
@@ -136,14 +145,14 @@ local function buildUI(player, head)
     local f  = {}
 
     f.bb = Instance.new("BillboardGui")
-    f.bb.Name             = "DarkNametag"
-    f.bb.Adornee          = head
+    f.bb.Name             = "DarkNametag_" .. player.Name
+    f.bb.Adornee          = head               -- wskazuje na Head przez Adornee
     f.bb.Size             = UDim2.fromOffset(dw, C.H)
     f.bb.StudsOffset      = C.StudsOffset
     f.bb.AlwaysOnTop      = C.AlwaysOnTop
     f.bb.ResetOnSpawn     = false
     f.bb.ClipsDescendants = false
-    f.bb.Parent           = head
+    f.bb.Parent           = tagContainer       -- rodzic: CoreGui folder, nie Head!
 
     f.cv = Instance.new("CanvasGroup", f.bb)
     f.cv.Size                   = UDim2.fromScale(1, 1)
@@ -300,7 +309,7 @@ local function buildUI(player, head)
 end
 
 -- ─────────────────────────────────────────────
---   Per-player Heartbeat (dystans + fade)
+--   Per-player Heartbeat
 -- ─────────────────────────────────────────────
 
 local function startLoop(player, r)
@@ -403,50 +412,50 @@ local function destroyTag(player)
 end
 
 -- ─────────────────────────────────────────────
---   Attach tag do konkretnego Head
+--   Attach tag do Head przez Adornee
 -- ─────────────────────────────────────────────
 
 local function attachToHead(player, head)
     local d = tags[player]
     if not d or not enabled then return end
+    if not head or not head.Parent then return end
+
+    -- Jeśli już mamy tag z tym samym Adornee — nie przebudowuj
+    if d.refs and d.refs.bb and d.refs.bb.Adornee == head then return end
 
     destroyTagUI(player)
 
-    local refs = buildUI(player, head)
-    local hb   = startLoop(player, refs)
-    d.refs      = refs
-    d.heartbeat = hb
+    local ok, err = pcall(function()
+        local refs = buildUI(player, head)
+        local hb   = startLoop(player, refs)
+        d.refs      = refs
+        d.heartbeat = hb
+    end)
+
+    if not ok then
+        warn("attachToHead fail [" .. player.Name .. "]: " .. tostring(err))
+    end
 end
 
 -- ─────────────────────────────────────────────
---   WATCHER — aktywne polling co 0.5s
---
---   HD Admin ;char nie odpala CharacterAdded.
---   Zamiast polegać na zdarzeniach, co 0.5s
---   sprawdzamy:
---   1. Czy postać się zmieniła (inny obiekt)
---   2. Czy Head się zmienił (inny obiekt)
---   3. Czy BillboardGui nadal istnieje w Head
---
---   Jeśli cokolwiek się zmieniło — odbudowujemy tag.
+--   Watcher — polling co 0.5s
+--   Jedyne co sprawdzamy to czy Adornee BB
+--   nadal wskazuje na aktualny Head gracza.
+--   Jeśli nie — aktualizujemy Adornee lub
+--   przebudowujemy tag.
 -- ─────────────────────────────────────────────
 
 local function startWatcher(player)
     local d = tags[player]
     if not d then return end
 
-    -- Token: nowa instancja = nowy watcher, stary się kończy
     local token = {}
     d.watchToken = token
 
     task.spawn(function()
-        local lastChar = nil
-        local lastHead = nil
-
         while true do
             task.wait(0.5)
 
-            -- Zatrzymaj jeśli gracz wyszedł lub wyłączono
             local dd = tags[player]
             if not dd or dd.watchToken ~= token then return end
             if not enabled then return end
@@ -454,30 +463,28 @@ local function startWatcher(player)
             local ch   = player.Character
             local head = ch and ch:FindFirstChild("Head")
 
-            -- Przypadek 1: brak postaci lub Head — wyczyść UI i czekaj
             if not ch or not head then
                 if dd.refs then destroyTagUI(player) end
-                lastChar = nil
-                lastHead = nil
                 continue
             end
 
-            -- Przypadek 2: postać lub Head się zmieniły (;char / ;re / morph)
-            if ch ~= lastChar or head ~= lastHead then
-                attachToHead(player, head)
-                lastChar = ch
-                lastHead = head
+            -- Przypadek 1: mamy refs i Adornee wskazuje na aktualny Head — OK
+            if dd.refs and dd.refs.bb and dd.refs.bb.Parent
+                and dd.refs.bb.Adornee == head then
                 continue
             end
 
-            -- Przypadek 3: postać ta sama, ale BillboardGui zniknął
-            -- (HD Admin mógł wyczyścić Head.Children albo tag padł inaczej)
-            local bb = head:FindFirstChild("DarkNametag")
-            if not bb then
-                attachToHead(player, head)
-                -- lastChar i lastHead bez zmian
+            -- Przypadek 2: brak refs LUB Adornee się zdezaktualizował
+            -- (nowy Head po ;char — Head.Locked nie blokuje Adornee!)
+            if dd.refs and dd.refs.bb and dd.refs.bb.Parent
+                and dd.refs.bb.Adornee ~= head then
+                -- Wystarczy zaktualizować Adornee — nie trzeba przebudowywać
+                dd.refs.bb.Adornee = head
                 continue
             end
+
+            -- Przypadek 3: brak refs — zbuduj od nowa
+            attachToHead(player, head)
         end
     end)
 end
@@ -499,12 +506,9 @@ local function setupPlayer(player)
     }
     local d = tags[player]
 
-    -- CharacterAdded: szybka ścieżka dla ;re / normalny respawn
-    -- Watcher i tak to złapie, ale CharacterAdded daje nam
-    -- natychmiastową reakcję bez czekania na polling
+    -- CharacterAdded: szybka ścieżka dla ;re
     d.charConn = player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
-            -- Poczekaj aż Head będzie gotowy (max 5s, co 50ms)
             local head
             local deadline = tick() + 5
             while tick() < deadline do
@@ -513,14 +517,12 @@ local function setupPlayer(player)
                 if head then break end
                 task.wait(0.05)
             end
-            if not head then return end
-            if not tags[player] then return end
-            -- Watcher za chwilę też to wykryje, ale zrobimy to od razu
+            if not head or not tags[player] then return end
             attachToHead(player, head)
         end)
     end)
 
-    -- Uruchom watcher — to jest główne zabezpieczenie dla ;char
+    -- Watcher: obsługuje ;char (bez CharacterAdded) i wszystko inne
     startWatcher(player)
 end
 
@@ -535,11 +537,8 @@ getgenv().enableNametags = function()
         if not tags[p] then
             setupPlayer(p)
         else
-            -- Gracz już śledzony — uruchom watcher jeśli nie działa
             local d = tags[p]
-            if not d.watchToken then
-                startWatcher(p)
-            end
+            if not d.watchToken then startWatcher(p) end
         end
     end
     startGlobal()
@@ -549,7 +548,7 @@ getgenv().disableNametags = function()
     enabled = false
     for pl, d in tags do
         destroyTagUI(pl)
-        d.watchToken = nil  -- zatrzymuje wszystkie watchery
+        d.watchToken = nil
     end
     if globalLoop then globalLoop:Disconnect() globalLoop = nil end
 end
@@ -569,11 +568,13 @@ getgenv().updateNametagColor = function(color)
 end
 
 -- ─────────────────────────────────────────────
---   Eventy
+--   Eventy i init
 -- ─────────────────────────────────────────────
 
 S.Players.PlayerAdded:Connect(setupPlayer)
-S.Players.PlayerRemoving:Connect(destroyTag)
+S.Players.PlayerRemoving:Connect(function(player)
+    destroyTag(player)
+end)
 
 task.wait(0)
 for _, p in S.Players:GetPlayers() do
