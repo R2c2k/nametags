@@ -1,9 +1,8 @@
 -- =============================================
---       NAMETAG SYSTEM v9.0 - Dark Theme
+--       NAMETAG SYSTEM v10.0 - Dark Theme
 --       Standalone file - load via HttpGet
---       FIX: HD Admin ;char / morph support
---       FIX: AncestryChanged Head detection
---       FIX: retry loop zamiast WaitForChild
+--       FIX: ;char polling fallback (HD Admin)
+--       FIX: AncestryChanged + token system
 -- =============================================
 
 local S = {
@@ -48,9 +47,6 @@ local C = {
     FontMain     = Enum.Font.GothamBold,
     FontSub      = Enum.Font.Gotham,
     FontMeta     = Enum.Font.Gotham,
-    -- Retry settings (dla HD Admin / morph pattern)
-    HeadRetryInterval = 0.05,  -- co ile sekund sprawdzamy Head
-    HeadRetryTimeout  = 8,     -- max czas czekania na Head
 }
 
 local enabled     = false
@@ -308,7 +304,7 @@ end
 -- ─────────────────────────────────────────────
 
 local function startLoop(player, r)
-    local ct = 1
+    local ct        = 1
     local distTimer = 0
     local conn
     conn = S.Run.Heartbeat:Connect(function(dt)
@@ -322,7 +318,6 @@ local function startLoop(player, r)
             r.cv.GroupTransparency = ct
             return
         end
-        -- Throttle: aktualizuj tekst dystansu co ~10 klatek
         distTimer = distTimer + dt
         if distTimer >= 0.16 then
             distTimer = 0
@@ -391,24 +386,9 @@ end
 local function destroyTagUI(player)
     local d = tags[player]
     if not d then return end
-    -- Zatrzymaj heartbeat tagu
-    if d.heartbeat then
-        d.heartbeat:Disconnect()
-        d.heartbeat = nil
-    end
-    -- Zatrzymaj AncestryChanged na Head
-    if d.headConn then
-        d.headConn:Disconnect()
-        d.headConn = nil
-    end
-    -- Zabij avatar async
-    if d.refs and d.refs.killAvatar then
-        d.refs.killAvatar()
-    end
-    -- Zniszcz BillboardGui
-    if d.refs and d.refs.bb and d.refs.bb.Parent then
-        d.refs.bb:Destroy()
-    end
+    if d.heartbeat then d.heartbeat:Disconnect() d.heartbeat = nil end
+    if d.refs and d.refs.killAvatar then d.refs.killAvatar() end
+    if d.refs and d.refs.bb and d.refs.bb.Parent then d.refs.bb:Destroy() end
     d.refs         = nil
     d.overlapTrans = 0
 end
@@ -417,80 +397,88 @@ local function destroyTag(player)
     local d = tags[player]
     if not d then return end
     destroyTagUI(player)
-    if d.charConn then
-        d.charConn:Disconnect()
-        d.charConn = nil
-    end
-    -- Anuluj aktywny retry spawn (przez token)
-    d.retryToken = nil
+    if d.charConn then d.charConn:Disconnect() d.charConn = nil end
+    d.watchToken = nil
     tags[player] = nil
 end
 
 -- ─────────────────────────────────────────────
---   Core: buduj tag z retry loop
---   (obsługa HD Admin double-fire pattern)
+--   Attach tag do konkretnego Head
 -- ─────────────────────────────────────────────
 
-local function buildTagForChar(player, newChar, retryToken)
+local function attachToHead(player, head)
+    local d = tags[player]
+    if not d or not enabled then return end
+
+    destroyTagUI(player)
+
+    local refs = buildUI(player, head)
+    local hb   = startLoop(player, refs)
+    d.refs      = refs
+    d.heartbeat = hb
+end
+
+-- ─────────────────────────────────────────────
+--   WATCHER — aktywne polling co 0.5s
+--
+--   HD Admin ;char nie odpala CharacterAdded.
+--   Zamiast polegać na zdarzeniach, co 0.5s
+--   sprawdzamy:
+--   1. Czy postać się zmieniła (inny obiekt)
+--   2. Czy Head się zmienił (inny obiekt)
+--   3. Czy BillboardGui nadal istnieje w Head
+--
+--   Jeśli cokolwiek się zmieniło — odbudowujemy tag.
+-- ─────────────────────────────────────────────
+
+local function startWatcher(player)
+    local d = tags[player]
+    if not d then return end
+
+    -- Token: nowa instancja = nowy watcher, stary się kończy
+    local token = {}
+    d.watchToken = token
+
     task.spawn(function()
-        -- Retry loop: czekamy na Head co HeadRetryInterval
-        -- zamiast WaitForChild z timeout który blokuje
-        local head
-        local deadline = tick() + C.HeadRetryTimeout
-        while tick() < deadline do
-            -- Przerwij jeśli token wygasł (nowy CharacterAdded przyszedł)
-            local d = tags[player]
-            if not d or d.retryToken ~= retryToken then return end
-            -- Przerwij jeśli gracz już ma inną postać
-            if player.Character ~= newChar then return end
+        local lastChar = nil
+        local lastHead = nil
 
-            head = newChar:FindFirstChild("Head")
-            if head then break end
-            task.wait(C.HeadRetryInterval)
-        end
+        while true do
+            task.wait(0.5)
 
-        -- Finalne sprawdzenia przed budowaniem UI
-        if not head then return end
-        local d = tags[player]
-        if not d or d.retryToken ~= retryToken then return end
-        if player.Character ~= newChar then return end
-        if not enabled then return end
-
-        -- Zniszcz stary UI (jeśli był)
-        destroyTagUI(player)
-
-        -- Zbuduj nowy UI
-        local refs = buildUI(player, head)
-        local hb   = startLoop(player, refs)
-        d.refs      = refs
-        d.heartbeat = hb
-
-        -- Monitoruj zniszczenie Head przez HD Admin
-        -- (np. character:Destroy() bez standardowego respawn)
-        d.headConn = head.AncestryChanged:Connect(function()
-            if head.Parent then return end  -- Head tylko zmienił rodzica, nie zniknął
-            -- Head zniknął — wyczyść UI
-            -- NIE niszczymy charConn, czekamy na następne CharacterAdded
+            -- Zatrzymaj jeśli gracz wyszedł lub wyłączono
             local dd = tags[player]
-            if dd then
-                if dd.headConn then
-                    dd.headConn:Disconnect()
-                    dd.headConn = nil
-                end
-                if dd.heartbeat then
-                    dd.heartbeat:Disconnect()
-                    dd.heartbeat = nil
-                end
-                if dd.refs and dd.refs.killAvatar then
-                    dd.refs.killAvatar()
-                end
-                if dd.refs and dd.refs.bb and dd.refs.bb.Parent then
-                    dd.refs.bb:Destroy()
-                end
-                dd.refs         = nil
-                dd.overlapTrans = 0
+            if not dd or dd.watchToken ~= token then return end
+            if not enabled then return end
+
+            local ch   = player.Character
+            local head = ch and ch:FindFirstChild("Head")
+
+            -- Przypadek 1: brak postaci lub Head — wyczyść UI i czekaj
+            if not ch or not head then
+                if dd.refs then destroyTagUI(player) end
+                lastChar = nil
+                lastHead = nil
+                continue
             end
-        end)
+
+            -- Przypadek 2: postać lub Head się zmieniły (;char / ;re / morph)
+            if ch ~= lastChar or head ~= lastHead then
+                attachToHead(player, head)
+                lastChar = ch
+                lastHead = head
+                continue
+            end
+
+            -- Przypadek 3: postać ta sama, ale BillboardGui zniknął
+            -- (HD Admin mógł wyczyścić Head.Children albo tag padł inaczej)
+            local bb = head:FindFirstChild("DarkNametag")
+            if not bb then
+                attachToHead(player, head)
+                -- lastChar i lastHead bez zmian
+                continue
+            end
+        end
     end)
 end
 
@@ -500,32 +488,40 @@ end
 
 local function setupPlayer(player)
     if player == LP then return end
-    -- Nie rejestruj dwa razy
     if tags[player] then return end
 
     tags[player] = {
         refs         = nil,
         heartbeat    = nil,
         charConn     = nil,
-        headConn     = nil,
-        retryToken   = nil,
+        watchToken   = nil,
         overlapTrans = 0,
     }
     local d = tags[player]
 
+    -- CharacterAdded: szybka ścieżka dla ;re / normalny respawn
+    -- Watcher i tak to złapie, ale CharacterAdded daje nam
+    -- natychmiastową reakcję bez czekania na polling
     d.charConn = player.CharacterAdded:Connect(function(newChar)
-        -- Nowy unikalny token — anuluje poprzedni retry spawn
-        local token = {}
-        d.retryToken = token
-        buildTagForChar(player, newChar, token)
+        task.spawn(function()
+            -- Poczekaj aż Head będzie gotowy (max 5s, co 50ms)
+            local head
+            local deadline = tick() + 5
+            while tick() < deadline do
+                if not tags[player] then return end
+                head = newChar:FindFirstChild("Head")
+                if head then break end
+                task.wait(0.05)
+            end
+            if not head then return end
+            if not tags[player] then return end
+            -- Watcher za chwilę też to wykryje, ale zrobimy to od razu
+            attachToHead(player, head)
+        end)
     end)
 
-    -- Obsłuż postać która już istnieje przy dołączeniu
-    if player.Character then
-        local token = {}
-        d.retryToken = token
-        buildTagForChar(player, player.Character, token)
-    end
+    -- Uruchom watcher — to jest główne zabezpieczenie dla ;char
+    startWatcher(player)
 end
 
 -- ─────────────────────────────────────────────
@@ -539,12 +535,10 @@ getgenv().enableNametags = function()
         if not tags[p] then
             setupPlayer(p)
         else
-            -- Gracz już śledzony ale tag może być martwy — spróbuj odbudować
+            -- Gracz już śledzony — uruchom watcher jeśli nie działa
             local d = tags[p]
-            if not d.refs and p.Character then
-                local token = {}
-                d.retryToken = token
-                buildTagForChar(p, p.Character, token)
+            if not d.watchToken then
+                startWatcher(p)
             end
         end
     end
@@ -553,16 +547,11 @@ end
 
 getgenv().disableNametags = function()
     enabled = false
-    for pl in tags do
+    for pl, d in tags do
         destroyTagUI(pl)
-        -- Anuluj aktywne retry spawny
-        local d = tags[pl]
-        if d then d.retryToken = nil end
+        d.watchToken = nil  -- zatrzymuje wszystkie watchery
     end
-    if globalLoop then
-        globalLoop:Disconnect()
-        globalLoop = nil
-    end
+    if globalLoop then globalLoop:Disconnect() globalLoop = nil end
 end
 
 getgenv().updateNametagColor = function(color)
@@ -586,8 +575,6 @@ end
 S.Players.PlayerAdded:Connect(setupPlayer)
 S.Players.PlayerRemoving:Connect(destroyTag)
 
--- task.wait(0) daje silnikowi jeden frame zanim zaczniemy
--- iterować po graczach — zapobiega race condition przy starcie
 task.wait(0)
 for _, p in S.Players:GetPlayers() do
     setupPlayer(p)
