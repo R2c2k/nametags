@@ -1,0 +1,594 @@
+-- =============================================
+--       NAMETAG SYSTEM v9.0 - Dark Theme
+--       Standalone file - load via HttpGet
+--       FIX: HD Admin ;char / morph support
+--       FIX: AncestryChanged Head detection
+--       FIX: retry loop zamiast WaitForChild
+-- =============================================
+
+local S = {
+    Players = game:GetService("Players"),
+    Run     = game:GetService("RunService"),
+    Text    = game:GetService("TextService"),
+    Camera  = workspace.CurrentCamera,
+}
+local LP = S.Players.LocalPlayer
+
+local C = {
+    H            = 46,
+    AvatarSize   = 28,
+    WidthMin     = 100,
+    WidthMax     = 500,
+    WidthPadR    = 10,
+    StudsOffset  = Vector3.new(0, 2.4, 0),
+    AlwaysOnTop  = true,
+    FadeNearMin  = 2,
+    FadeNearMax  = 6,
+    FadeFarMin   = 55,
+    FadeFarMax   = 70,
+    OverlapPx    = 180,
+    OverlapBonus = 0.65,
+    LerpSpeed    = 12,
+    GlassColor   = Color3.fromRGB(25, 25, 25),
+    GlassTrans   = 0.12,
+    BorderColor  = Color3.fromRGB(60, 60, 60),
+    BorderTrans  = 0.40,
+    ShadowColor  = Color3.fromRGB(0, 0, 0),
+    ShadowTrans  = 0.60,
+    Accent       = Color3.fromRGB(0, 160, 255),
+    TextMain     = Color3.fromRGB(240, 240, 240),
+    TextSub      = Color3.fromRGB(178, 178, 178),
+    TextMeta     = Color3.fromRGB(140, 140, 140),
+    SepColor     = Color3.fromRGB(50, 50, 65),
+    DistClose    = 20,
+    DistFar      = 60,
+    ColorClose   = Color3.fromRGB(80, 220, 120),
+    ColorMid     = Color3.fromRGB(255, 200, 60),
+    ColorFar     = Color3.fromRGB(255, 80, 80),
+    FontMain     = Enum.Font.GothamBold,
+    FontSub      = Enum.Font.Gotham,
+    FontMeta     = Enum.Font.Gotham,
+    -- Retry settings (dla HD Admin / morph pattern)
+    HeadRetryInterval = 0.05,  -- co ile sekund sprawdzamy Head
+    HeadRetryTimeout  = 8,     -- max czas czekania na Head
+}
+
+local enabled     = false
+local accentColor = C.Accent
+local tags        = {}
+local globalLoop  = nil
+
+-- ─────────────────────────────────────────────
+--   Utility
+-- ─────────────────────────────────────────────
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function lerpColor(c1, c2, t)
+    return Color3.new(
+        lerp(c1.R, c2.R, t),
+        lerp(c1.G, c2.G, t),
+        lerp(c1.B, c2.B, t)
+    )
+end
+
+local function distColor(d)
+    local mid = (C.DistClose + C.DistFar) / 2
+    if d <= C.DistClose then
+        return C.ColorClose
+    elseif d <= mid then
+        return lerpColor(C.ColorClose, C.ColorMid, (d - C.DistClose) / (mid - C.DistClose))
+    elseif d <= C.DistFar then
+        return lerpColor(C.ColorMid, C.ColorFar, (d - mid) / (C.DistFar - mid))
+    else
+        return C.ColorFar
+    end
+end
+
+local function fadeTrans(d)
+    if d < C.FadeNearMin then return 1 end
+    if d < C.FadeNearMax then return 1 - (d - C.FadeNearMin) / (C.FadeNearMax - C.FadeNearMin) end
+    if d < C.FadeFarMin  then return 0 end
+    if d < C.FadeFarMax  then return (d - C.FadeFarMin) / (C.FadeFarMax - C.FadeFarMin) end
+    return 1
+end
+
+local function calcWidth(dispName, userName)
+    local tx  = C.AvatarSize + 18
+    local big = Vector2.new(9999, 16)
+    local sub = Vector2.new(9999, 13)
+    local w = math.max(
+        S.Text:GetTextSize(dispName,      11, C.FontMain, big).X,
+        S.Text:GetTextSize("@"..userName,  9, C.FontSub,  sub).X,
+        S.Text:GetTextSize("999 studs",    8, C.FontMeta, sub).X
+    )
+    return math.clamp(tx + w + C.WidthPadR, C.WidthMin, C.WidthMax)
+end
+
+local function w2s(pos)
+    local sp, on = S.Camera:WorldToScreenPoint(pos)
+    if not on or sp.Z <= 0 then return nil end
+    return Vector2.new(sp.X, sp.Y)
+end
+
+local function mkLabel(parent, props)
+    local l = Instance.new("TextLabel", parent)
+    for k, v in props do l[k] = v end
+    return l
+end
+
+local function mkFrame(parent, props)
+    local f = Instance.new("Frame", parent)
+    for k, v in props do f[k] = v end
+    return f
+end
+
+local function accentDark(color)
+    return Color3.new(color.R * 0.6, color.G * 0.6, color.B * 0.6)
+end
+
+-- ─────────────────────────────────────────────
+--   UI Builder
+-- ─────────────────────────────────────────────
+
+local function buildUI(player, head)
+    local dw = calcWidth(player.DisplayName, player.Name)
+    local tx = C.AvatarSize + 18
+    local tw = dw - tx - C.WidthPadR
+    local f  = {}
+
+    f.bb = Instance.new("BillboardGui")
+    f.bb.Name             = "DarkNametag"
+    f.bb.Adornee          = head
+    f.bb.Size             = UDim2.fromOffset(dw, C.H)
+    f.bb.StudsOffset      = C.StudsOffset
+    f.bb.AlwaysOnTop      = C.AlwaysOnTop
+    f.bb.ResetOnSpawn     = false
+    f.bb.ClipsDescendants = false
+    f.bb.Parent           = head
+
+    f.cv = Instance.new("CanvasGroup", f.bb)
+    f.cv.Size                   = UDim2.fromScale(1, 1)
+    f.cv.BackgroundTransparency = 1
+    f.cv.GroupTransparency      = 1
+
+    f.sh = mkFrame(f.cv, {
+        Size                   = UDim2.fromScale(1, 1),
+        Position               = UDim2.fromOffset(2, 3),
+        BackgroundColor3       = C.ShadowColor,
+        BackgroundTransparency = C.ShadowTrans,
+        BorderSizePixel        = 0,
+        ZIndex                 = 1,
+    })
+    Instance.new("UICorner", f.sh).CornerRadius = UDim.new(0, 8)
+
+    f.gl = mkFrame(f.cv, {
+        Size                   = UDim2.fromScale(1, 1),
+        BackgroundColor3       = C.GlassColor,
+        BackgroundTransparency = C.GlassTrans,
+        BorderSizePixel        = 0,
+        ZIndex                 = 2,
+    })
+    Instance.new("UICorner", f.gl).CornerRadius = UDim.new(0, 8)
+
+    f.bs = Instance.new("UIStroke", f.gl)
+    f.bs.Color           = C.BorderColor
+    f.bs.Transparency    = C.BorderTrans
+    f.bs.Thickness       = 1
+    f.bs.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    f.ab = mkFrame(f.gl, {
+        Name             = "AccentBar",
+        Size             = UDim2.new(0, 3, 1, -12),
+        Position         = UDim2.fromOffset(5, 6),
+        BackgroundColor3 = accentColor,
+        BorderSizePixel  = 0,
+        ZIndex           = 3,
+    })
+    Instance.new("UICorner", f.ab).CornerRadius = UDim.new(0, 3)
+
+    f.abGrad = Instance.new("UIGradient", f.ab)
+    f.abGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+        ColorSequenceKeypoint.new(1, accentDark(accentColor)),
+    })
+    f.abGrad.Rotation = 90
+
+    f.ring = mkFrame(f.gl, {
+        Size             = UDim2.fromOffset(C.AvatarSize + 3, C.AvatarSize + 3),
+        Position         = UDim2.new(0, 12, 0.5, 0),
+        AnchorPoint      = Vector2.new(0, 0.5),
+        BackgroundColor3 = accentColor,
+        BorderSizePixel  = 0,
+        ZIndex           = 3,
+    })
+    Instance.new("UICorner", f.ring).CornerRadius = UDim.new(1, 0)
+
+    f.av = Instance.new("ImageLabel", f.gl)
+    f.av.Name                   = "Avatar"
+    f.av.Size                   = UDim2.fromOffset(C.AvatarSize, C.AvatarSize)
+    f.av.Position               = UDim2.new(0, 13, 0.5, 0)
+    f.av.AnchorPoint            = Vector2.new(0, 0.5)
+    f.av.BackgroundColor3       = Color3.fromRGB(30, 30, 38)
+    f.av.BackgroundTransparency = 0
+    f.av.Image                  = ""
+    f.av.ZIndex                 = 4
+    Instance.new("UICorner", f.av).CornerRadius = UDim.new(1, 0)
+
+    local avatarToken = {}
+    task.spawn(function()
+        local myToken = avatarToken
+        local ok, img = pcall(
+            S.Players.GetUserThumbnailAsync, S.Players,
+            player.UserId,
+            Enum.ThumbnailType.HeadShot,
+            Enum.ThumbnailSize.Size48x48
+        )
+        if ok and img and avatarToken == myToken and f.av.Parent then
+            f.av.Image                  = img
+            f.av.BackgroundTransparency = 1
+        end
+    end)
+
+    mkLabel(f.gl, {
+        Text                   = player.DisplayName,
+        Size                   = UDim2.fromOffset(tw, 16),
+        Position               = UDim2.fromOffset(tx, 6),
+        Font                   = C.FontMain,
+        TextColor3             = C.TextMain,
+        TextSize               = 11,
+        TextScaled             = false,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        ZIndex                 = 4,
+    })
+
+    mkLabel(f.gl, {
+        Text                   = "@" .. player.Name,
+        Size                   = UDim2.fromOffset(tw, 12),
+        Position               = UDim2.fromOffset(tx, 21),
+        Font                   = C.FontSub,
+        TextColor3             = C.TextSub,
+        TextSize               = 9,
+        TextScaled             = false,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        ZIndex                 = 4,
+    })
+
+    f.sep = mkFrame(f.gl, {
+        Size                   = UDim2.new(0, tw, 0, 1),
+        Position               = UDim2.fromOffset(tx, 32),
+        BackgroundColor3       = C.SepColor,
+        BackgroundTransparency = 0,
+        BorderSizePixel        = 0,
+        ZIndex                 = 4,
+    })
+    Instance.new("UIGradient", f.sep).Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0,   0),
+        NumberSequenceKeypoint.new(0.7, 0),
+        NumberSequenceKeypoint.new(1,   1),
+    })
+
+    f.dot = mkLabel(f.gl, {
+        Text                   = "●",
+        Size                   = UDim2.fromOffset(10, 11),
+        Position               = UDim2.fromOffset(tx, 34),
+        Font                   = C.FontMeta,
+        TextColor3             = C.ColorClose,
+        TextSize               = 7,
+        TextScaled             = false,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        ZIndex                 = 4,
+    })
+
+    f.dl = mkLabel(f.gl, {
+        Name                   = "Distance",
+        Text                   = "0 studs",
+        Size                   = UDim2.fromOffset(tw - 12, 11),
+        Position               = UDim2.fromOffset(tx + 11, 34),
+        Font                   = C.FontMeta,
+        TextColor3             = C.TextMeta,
+        TextSize               = 8,
+        TextScaled             = false,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        ZIndex                 = 4,
+    })
+
+    f.killAvatar = function() avatarToken = nil end
+    return f
+end
+
+-- ─────────────────────────────────────────────
+--   Per-player Heartbeat (dystans + fade)
+-- ─────────────────────────────────────────────
+
+local function startLoop(player, r)
+    local ct = 1
+    local distTimer = 0
+    local conn
+    conn = S.Run.Heartbeat:Connect(function(dt)
+        if not r.bb or not r.bb.Parent then conn:Disconnect() return end
+        local lc   = LP.Character
+        local lrp  = lc and lc:FindFirstChild("HumanoidRootPart")
+        local ch   = player.Character
+        local head = ch and ch:FindFirstChild("Head")
+        if not lrp or not head then
+            ct = lerp(ct, 1, math.min(dt * C.LerpSpeed, 1))
+            r.cv.GroupTransparency = ct
+            return
+        end
+        -- Throttle: aktualizuj tekst dystansu co ~10 klatek
+        distTimer = distTimer + dt
+        if distTimer >= 0.16 then
+            distTimer = 0
+            local dist = (head.Position - lrp.Position).Magnitude
+            r.dl.Text = string.format("%.0f studs", dist)
+            local dc = distColor(dist)
+            r.dot.TextColor3 = dc
+            r.dl.TextColor3  = dc
+        end
+        local dist2 = (head.Position - lrp.Position).Magnitude
+        local td    = tags[player]
+        local pen   = td and td.overlapTrans or 0
+        local goal  = math.max(fadeTrans(dist2), pen)
+        ct = lerp(ct, goal, math.min(dt * C.LerpSpeed, 1))
+        r.cv.GroupTransparency = ct
+    end)
+    return conn
+end
+
+-- ─────────────────────────────────────────────
+--   Global overlap loop
+-- ─────────────────────────────────────────────
+
+local function startGlobal()
+    if globalLoop then globalLoop:Disconnect() end
+    globalLoop = S.Run.Heartbeat:Connect(function()
+        local lc  = LP.Character
+        local lrp = lc and lc:FindFirstChild("HumanoidRootPart")
+        local ent = {}
+        for pl, d in tags do
+            if not d.refs then continue end
+            local ch   = pl.Character
+            local head = ch and ch:FindFirstChild("Head")
+            if not head then continue end
+            local dist = lrp and (head.Position - lrp.Position).Magnitude or math.huge
+            table.insert(ent, { pl = pl, dist = dist, sc = w2s(head.Position + C.StudsOffset) })
+        end
+        table.sort(ent, function(a, b) return a.dist < b.dist end)
+        for _, e in ent do
+            local d = tags[e.pl]
+            if d then d.overlapTrans = 0 end
+        end
+        for i = 1, #ent do
+            if not ent[i].sc then continue end
+            for j = i + 1, #ent do
+                if not ent[j].sc then continue end
+                local px = (ent[i].sc - ent[j].sc).Magnitude
+                if px < C.OverlapPx then
+                    local dj = tags[ent[j].pl]
+                    if dj then
+                        dj.overlapTrans = math.max(
+                            dj.overlapTrans or 0,
+                            (1 - px / C.OverlapPx) * C.OverlapBonus
+                        )
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────
+--   Tag lifecycle
+-- ─────────────────────────────────────────────
+
+local function destroyTagUI(player)
+    local d = tags[player]
+    if not d then return end
+    -- Zatrzymaj heartbeat tagu
+    if d.heartbeat then
+        d.heartbeat:Disconnect()
+        d.heartbeat = nil
+    end
+    -- Zatrzymaj AncestryChanged na Head
+    if d.headConn then
+        d.headConn:Disconnect()
+        d.headConn = nil
+    end
+    -- Zabij avatar async
+    if d.refs and d.refs.killAvatar then
+        d.refs.killAvatar()
+    end
+    -- Zniszcz BillboardGui
+    if d.refs and d.refs.bb and d.refs.bb.Parent then
+        d.refs.bb:Destroy()
+    end
+    d.refs         = nil
+    d.overlapTrans = 0
+end
+
+local function destroyTag(player)
+    local d = tags[player]
+    if not d then return end
+    destroyTagUI(player)
+    if d.charConn then
+        d.charConn:Disconnect()
+        d.charConn = nil
+    end
+    -- Anuluj aktywny retry spawn (przez token)
+    d.retryToken = nil
+    tags[player] = nil
+end
+
+-- ─────────────────────────────────────────────
+--   Core: buduj tag z retry loop
+--   (obsługa HD Admin double-fire pattern)
+-- ─────────────────────────────────────────────
+
+local function buildTagForChar(player, newChar, retryToken)
+    task.spawn(function()
+        -- Retry loop: czekamy na Head co HeadRetryInterval
+        -- zamiast WaitForChild z timeout który blokuje
+        local head
+        local deadline = tick() + C.HeadRetryTimeout
+        while tick() < deadline do
+            -- Przerwij jeśli token wygasł (nowy CharacterAdded przyszedł)
+            local d = tags[player]
+            if not d or d.retryToken ~= retryToken then return end
+            -- Przerwij jeśli gracz już ma inną postać
+            if player.Character ~= newChar then return end
+
+            head = newChar:FindFirstChild("Head")
+            if head then break end
+            task.wait(C.HeadRetryInterval)
+        end
+
+        -- Finalne sprawdzenia przed budowaniem UI
+        if not head then return end
+        local d = tags[player]
+        if not d or d.retryToken ~= retryToken then return end
+        if player.Character ~= newChar then return end
+        if not enabled then return end
+
+        -- Zniszcz stary UI (jeśli był)
+        destroyTagUI(player)
+
+        -- Zbuduj nowy UI
+        local refs = buildUI(player, head)
+        local hb   = startLoop(player, refs)
+        d.refs      = refs
+        d.heartbeat = hb
+
+        -- Monitoruj zniszczenie Head przez HD Admin
+        -- (np. character:Destroy() bez standardowego respawn)
+        d.headConn = head.AncestryChanged:Connect(function()
+            if head.Parent then return end  -- Head tylko zmienił rodzica, nie zniknął
+            -- Head zniknął — wyczyść UI
+            -- NIE niszczymy charConn, czekamy na następne CharacterAdded
+            local dd = tags[player]
+            if dd then
+                if dd.headConn then
+                    dd.headConn:Disconnect()
+                    dd.headConn = nil
+                end
+                if dd.heartbeat then
+                    dd.heartbeat:Disconnect()
+                    dd.heartbeat = nil
+                end
+                if dd.refs and dd.refs.killAvatar then
+                    dd.refs.killAvatar()
+                end
+                if dd.refs and dd.refs.bb and dd.refs.bb.Parent then
+                    dd.refs.bb:Destroy()
+                end
+                dd.refs         = nil
+                dd.overlapTrans = 0
+            end
+        end)
+    end)
+end
+
+-- ─────────────────────────────────────────────
+--   Setup gracza
+-- ─────────────────────────────────────────────
+
+local function setupPlayer(player)
+    if player == LP then return end
+    -- Nie rejestruj dwa razy
+    if tags[player] then return end
+
+    tags[player] = {
+        refs         = nil,
+        heartbeat    = nil,
+        charConn     = nil,
+        headConn     = nil,
+        retryToken   = nil,
+        overlapTrans = 0,
+    }
+    local d = tags[player]
+
+    d.charConn = player.CharacterAdded:Connect(function(newChar)
+        -- Nowy unikalny token — anuluje poprzedni retry spawn
+        local token = {}
+        d.retryToken = token
+        buildTagForChar(player, newChar, token)
+    end)
+
+    -- Obsłuż postać która już istnieje przy dołączeniu
+    if player.Character then
+        local token = {}
+        d.retryToken = token
+        buildTagForChar(player, player.Character, token)
+    end
+end
+
+-- ─────────────────────────────────────────────
+--   Globalne API
+-- ─────────────────────────────────────────────
+
+getgenv().enableNametags = function()
+    enabled = true
+    for _, p in S.Players:GetPlayers() do
+        if p == LP then continue end
+        if not tags[p] then
+            setupPlayer(p)
+        else
+            -- Gracz już śledzony ale tag może być martwy — spróbuj odbudować
+            local d = tags[p]
+            if not d.refs and p.Character then
+                local token = {}
+                d.retryToken = token
+                buildTagForChar(p, p.Character, token)
+            end
+        end
+    end
+    startGlobal()
+end
+
+getgenv().disableNametags = function()
+    enabled = false
+    for pl in tags do
+        destroyTagUI(pl)
+        -- Anuluj aktywne retry spawny
+        local d = tags[pl]
+        if d then d.retryToken = nil end
+    end
+    if globalLoop then
+        globalLoop:Disconnect()
+        globalLoop = nil
+    end
+end
+
+getgenv().updateNametagColor = function(color)
+    accentColor = color
+    for _, d in tags do
+        if d.refs then
+            d.refs.ab.BackgroundColor3 = color
+            d.refs.abGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(1, accentDark(color)),
+            })
+            d.refs.ring.BackgroundColor3 = color
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────
+--   Eventy
+-- ─────────────────────────────────────────────
+
+S.Players.PlayerAdded:Connect(setupPlayer)
+S.Players.PlayerRemoving:Connect(destroyTag)
+
+-- task.wait(0) daje silnikowi jeden frame zanim zaczniemy
+-- iterować po graczach — zapobiega race condition przy starcie
+task.wait(0)
+for _, p in S.Players:GetPlayers() do
+    setupPlayer(p)
+end
