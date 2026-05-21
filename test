@@ -228,11 +228,21 @@ local function buildUI(player, head)
     glass.ClipsDescendants       = true
     Instance.new("UICorner", glass).CornerRadius = UDim.new(0, cr)
 
-    local stroke = Instance.new("UIStroke", glass)
-    stroke.Color           = CFG.BorderColor
-    stroke.Transparency    = CFG.BorderTrans
-    stroke.Thickness       = 1
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    local borderRight = Instance.new("Frame", glass)
+    borderRight.Size                   = UDim2.new(0, 1, 1, 0)
+    borderRight.Position               = UDim2.new(1, -1, 0, 0)
+    borderRight.BackgroundColor3       = CFG.BorderColor
+    borderRight.BackgroundTransparency = CFG.BorderTrans
+    borderRight.BorderSizePixel        = 0
+    borderRight.ZIndex                 = 5
+
+    local borderBottom = Instance.new("Frame", glass)
+    borderBottom.Size                   = UDim2.new(1, 0, 0, 1)
+    borderBottom.Position               = UDim2.new(0, 0, 1, -1)
+    borderBottom.BackgroundColor3       = CFG.BorderColor
+    borderBottom.BackgroundTransparency = CFG.BorderTrans
+    borderBottom.BorderSizePixel        = 0
+    borderBottom.ZIndex                 = 5
 
     local glassGrad = Instance.new("UIGradient", glass)
     glassGrad.Color = ColorSequence.new({
