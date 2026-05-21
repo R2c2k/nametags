@@ -1,34 +1,46 @@
 -- =============================================
---       NAMETAG SYSTEM v12.0 - Dark Theme
---       Standalone file - load via HttpGet
---       v11: Head.Locked fix (CoreGui parent)
---       v12: perf + quality pass
+--       NAMETAG SYSTEM v13.0 - Dark Theme
+--       Pełny refactor: wydajność, jakość, UX
 -- =============================================
 
-local S = {
-    Players = game:GetService("Players"),
-    Run     = game:GetService("RunService"),
-    Text    = game:GetService("TextService"),
-    Camera  = workspace.CurrentCamera,
-    CoreGui = game:GetService("CoreGui"),
-}
-local LP = S.Players.LocalPlayer
+-- ─────────────────────────────────────────────
+--   Usługi
+-- ─────────────────────────────────────────────
 
-local C = {
-    H            = 46,
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TextService = game:GetService("TextService")
+local Camera     = workspace.CurrentCamera
+local CoreGui    = game:GetService("CoreGui")
+
+local lp = Players.LocalPlayer
+
+-- ─────────────────────────────────────────────
+--   Konfiguracja
+-- ─────────────────────────────────────────────
+
+local CFG = {
+    -- Wymiary
+    Height       = 46,
     AvatarSize   = 28,
     WidthMin     = 100,
     WidthMax     = 500,
     WidthPadR    = 10,
     StudsOffset  = Vector3.new(0, 2.4, 0),
+
+    -- Widoczność
     AlwaysOnTop  = true,
     FadeNearMin  = 2,
     FadeNearMax  = 6,
     FadeFarMin   = 55,
     FadeFarMax   = 70,
+    LerpSpeed    = 12,
+
+    -- Overlap
     OverlapPx    = 180,
     OverlapBonus = 0.65,
-    LerpSpeed    = 12,
+
+    -- Kolory UI
     GlassColor   = Color3.fromRGB(25, 25, 25),
     GlassTrans   = 0.12,
     BorderColor  = Color3.fromRGB(60, 60, 60),
@@ -40,27 +52,56 @@ local C = {
     TextSub      = Color3.fromRGB(178, 178, 178),
     TextMeta     = Color3.fromRGB(140, 140, 140),
     SepColor     = Color3.fromRGB(50, 50, 65),
+
+    -- Kolor dystansu
     DistClose    = 20,
     DistFar      = 60,
     ColorClose   = Color3.fromRGB(80, 220, 120),
     ColorMid     = Color3.fromRGB(255, 200, 60),
     ColorFar     = Color3.fromRGB(255, 80, 80),
+
+    -- Czcionki
     FontMain     = Enum.Font.GothamBold,
     FontSub      = Enum.Font.Gotham,
     FontMeta     = Enum.Font.Gotham,
+
+    -- Throttle (sekundy)
+    DistThrottle    = 0.16,
+    OverlapThrottle = 0.10,
+    WatcherInterval = 0.50,
 }
 
+-- ─────────────────────────────────────────────
+--   Stan globalny
+-- ─────────────────────────────────────────────
+
 local enabled     = false
-local accentColor = C.Accent
-local tags        = {}
+local accentColor = CFG.Accent
+
+-- Cache avatarów: userId -> URL obrazka
+-- Unika ponownego pobierania przy respawnie
+local avatarCache = {}
+
+-- Cache szerokości tagów: "DisplayName|UserName" -> liczba px
+-- Unika wielokrotnych wywołań GetTextSize dla tego samego gracza
+local widthCache  = {}
+
+-- Dane per gracz: Player -> { refs, heartbeat, charConn, watchToken, overlapTrans }
+local tagData     = {}
+
 local globalLoop  = nil
 
--- FIX: jeśli skrypt załadowany dwa razy — reużyj istniejący kontener
-local tagContainer = S.CoreGui:FindFirstChild("NametagContainer")
+-- ─────────────────────────────────────────────
+--   Kontener GUI w CoreGui
+--   Reużywany przy ponownym załadowaniu skryptu,
+--   ale stare połączenia są czyszczone (patrz cleanup)
+-- ─────────────────────────────────────────────
+
+local tagContainer = CoreGui:FindFirstChild("NametagContainer")
 if not tagContainer then
     tagContainer        = Instance.new("Folder")
     tagContainer.Name   = "NametagContainer"
-    tagContainer.Parent = S.CoreGui
+    tagContainer.Parent = CoreGui
 end
 
 -- ─────────────────────────────────────────────
@@ -71,122 +112,146 @@ local function lerp(a, b, t)
     return a + (b - a) * t
 end
 
+-- Interpolacja kolorów bez alokacji przez lerpColor w pętli —
+-- używamy bezpośrednio Color3.new zamiast pośredniej funkcji
 local function lerpColor(c1, c2, t)
     return Color3.new(
-        lerp(c1.R, c2.R, t),
-        lerp(c1.G, c2.G, t),
-        lerp(c1.B, c2.B, t)
+        c1.R + (c2.R - c1.R) * t,
+        c1.G + (c2.G - c1.G) * t,
+        c1.B + (c2.B - c1.B) * t
     )
 end
 
+-- Kolor w zależności od dystansu (zielony → żółty → czerwony)
 local function distColor(d)
-    local mid = (C.DistClose + C.DistFar) / 2
-    if d <= C.DistClose then
-        return C.ColorClose
+    local mid = (CFG.DistClose + CFG.DistFar) * 0.5
+    if d <= CFG.DistClose then
+        return CFG.ColorClose
     elseif d <= mid then
-        return lerpColor(C.ColorClose, C.ColorMid, (d - C.DistClose) / (mid - C.DistClose))
-    elseif d <= C.DistFar then
-        return lerpColor(C.ColorMid, C.ColorFar, (d - mid) / (C.DistFar - mid))
+        return lerpColor(CFG.ColorClose, CFG.ColorMid, (d - CFG.DistClose) / (mid - CFG.DistClose))
+    elseif d <= CFG.DistFar then
+        return lerpColor(CFG.ColorMid, CFG.ColorFar, (d - mid) / (CFG.DistFar - mid))
     else
-        return C.ColorFar
+        return CFG.ColorFar
     end
 end
 
+-- Przezroczystość w zależności od dystansu
+-- 0 = w pełni widoczny, 1 = niewidoczny
 local function fadeTrans(d)
-    if d < C.FadeNearMin then return 1 end
-    if d < C.FadeNearMax then return 1 - (d - C.FadeNearMin) / (C.FadeNearMax - C.FadeNearMin) end
-    if d < C.FadeFarMin  then return 0 end
-    if d < C.FadeFarMax  then return (d - C.FadeFarMin) / (C.FadeFarMax - C.FadeFarMin) end
+    if d < CFG.FadeNearMin then return 1 end
+    if d < CFG.FadeNearMax then return 1 - (d - CFG.FadeNearMin) / (CFG.FadeNearMax - CFG.FadeNearMin) end
+    if d < CFG.FadeFarMin  then return 0 end
+    if d < CFG.FadeFarMax  then return (d - CFG.FadeFarMin) / (CFG.FadeFarMax - CFG.FadeFarMin) end
     return 1
 end
 
+-- Szerokość tagu z cache — GetTextSize wywoływane tylko raz na gracza
 local function calcWidth(dispName, userName)
-    local tx  = C.AvatarSize + 18
-    local big = Vector2.new(9999, 16)
-    local sub = Vector2.new(9999, 13)
+    local key = dispName .. "|" .. userName
+    if widthCache[key] then return widthCache[key] end
+
+    local avatarOffset = CFG.AvatarSize + 18
+    local bigBounds    = Vector2.new(9999, 16)
+    local subBounds    = Vector2.new(9999, 13)
+
     local w = math.max(
-        S.Text:GetTextSize(dispName,      11, C.FontMain, big).X,
-        S.Text:GetTextSize("@"..userName,  9, C.FontSub,  sub).X,
-        S.Text:GetTextSize("999 studs",    8, C.FontMeta, sub).X
+        TextService:GetTextSize(dispName,         11, CFG.FontMain, bigBounds).X,
+        TextService:GetTextSize("@" .. userName,   9, CFG.FontSub,  subBounds).X,
+        TextService:GetTextSize("999 studs",        8, CFG.FontMeta, subBounds).X
     )
-    return math.clamp(tx + w + C.WidthPadR, C.WidthMin, C.WidthMax)
+
+    local result = math.clamp(avatarOffset + w + CFG.WidthPadR, CFG.WidthMin, CFG.WidthMax)
+    widthCache[key] = result
+    return result
 end
 
-local function w2s(pos)
-    local sp, on = S.Camera:WorldToScreenPoint(pos)
-    if not on or sp.Z <= 0 then return nil end
+-- Projekcja world → screen (nil jeśli za kamerą)
+local function worldToScreen(pos)
+    local sp, onScreen = Camera:WorldToScreenPoint(pos)
+    if not onScreen or sp.Z <= 0 then return nil end
     return Vector2.new(sp.X, sp.Y)
 end
 
-local function mkLabel(parent, props)
-    local l = Instance.new("TextLabel", parent)
-    for k, v in props do l[k] = v end
-    return l
-end
-
-local function mkFrame(parent, props)
-    local f = Instance.new("Frame", parent)
-    for k, v in props do f[k] = v end
-    return f
-end
-
+-- Przyciemniony akcent dla gradientu paska
 local function accentDark(color)
     return Color3.new(color.R * 0.6, color.G * 0.6, color.B * 0.6)
 end
 
+-- Pomocnik: tworzy TextLabel z podanymi właściwościami
+local function makeLabel(parent, props)
+    local label = Instance.new("TextLabel", parent)
+    for k, v in props do label[k] = v end
+    return label
+end
+
+-- Pomocnik: tworzy Frame z podanymi właściwościami
+local function makeFrame(parent, props)
+    local frame = Instance.new("Frame", parent)
+    for k, v in props do frame[k] = v end
+    return frame
+end
+
 -- ─────────────────────────────────────────────
---   UI Builder
---   BillboardGui siedzi w CoreGui (Locked fix)
---   Head wskazany przez Adornee
+--   Budowanie UI
+--   BillboardGui siedzi w CoreGui (fix Head.Locked),
+--   Head wskazany przez Adornee.
 -- ─────────────────────────────────────────────
 
 local function buildUI(player, head)
-    local dw = calcWidth(player.DisplayName, player.Name)
-    local tx = C.AvatarSize + 18
-    local tw = dw - tx - C.WidthPadR
-    local f  = {}
+    local totalWidth  = calcWidth(player.DisplayName, player.Name)
+    local textOffset  = CFG.AvatarSize + 18
+    local textWidth   = totalWidth - textOffset - CFG.WidthPadR
+    local refs        = {}
 
-    f.bb = Instance.new("BillboardGui")
-    f.bb.Name             = "DarkNametag_" .. player.Name
-    f.bb.Adornee          = head
-    f.bb.Size             = UDim2.fromOffset(dw, C.H)
-    f.bb.StudsOffset      = C.StudsOffset
-    f.bb.AlwaysOnTop      = C.AlwaysOnTop
-    f.bb.ResetOnSpawn     = false
-    f.bb.ClipsDescendants = false
-    f.bb.Parent           = tagContainer
+    -- BillboardGui
+    refs.billboard = Instance.new("BillboardGui")
+    refs.billboard.Name             = "DarkNametag_" .. player.Name
+    refs.billboard.Adornee          = head
+    refs.billboard.Size             = UDim2.fromOffset(totalWidth, CFG.Height)
+    refs.billboard.StudsOffset      = CFG.StudsOffset
+    refs.billboard.AlwaysOnTop      = CFG.AlwaysOnTop
+    refs.billboard.ResetOnSpawn     = false
+    refs.billboard.ClipsDescendants = false
+    refs.billboard.Parent           = tagContainer
 
-    f.cv = Instance.new("CanvasGroup", f.bb)
-    f.cv.Size                   = UDim2.fromScale(1, 1)
-    f.cv.BackgroundTransparency = 1
-    f.cv.GroupTransparency      = 1
+    -- CanvasGroup: płynne fade przez GroupTransparency
+    -- Zaczyna od 1 (niewidoczny) → ease-in przy pojawieniu się
+    refs.canvas = Instance.new("CanvasGroup", refs.billboard)
+    refs.canvas.Size                   = UDim2.fromScale(1, 1)
+    refs.canvas.BackgroundTransparency = 1
+    refs.canvas.GroupTransparency      = 1  -- ease-in: zaczyna niewidoczny
 
-    f.sh = mkFrame(f.cv, {
+    -- Cień
+    local shadow = makeFrame(refs.canvas, {
         Size                   = UDim2.fromScale(1, 1),
         Position               = UDim2.fromOffset(2, 3),
-        BackgroundColor3       = C.ShadowColor,
-        BackgroundTransparency = C.ShadowTrans,
+        BackgroundColor3       = CFG.ShadowColor,
+        BackgroundTransparency = CFG.ShadowTrans,
         BorderSizePixel        = 0,
         ZIndex                 = 1,
     })
-    Instance.new("UICorner", f.sh).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, 8)
 
-    f.gl = mkFrame(f.cv, {
+    -- Tło szklane
+    local glass = makeFrame(refs.canvas, {
         Size                   = UDim2.fromScale(1, 1),
-        BackgroundColor3       = C.GlassColor,
-        BackgroundTransparency = C.GlassTrans,
+        BackgroundColor3       = CFG.GlassColor,
+        BackgroundTransparency = CFG.GlassTrans,
         BorderSizePixel        = 0,
         ZIndex                 = 2,
     })
-    Instance.new("UICorner", f.gl).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", glass).CornerRadius = UDim.new(0, 8)
 
-    f.bs = Instance.new("UIStroke", f.gl)
-    f.bs.Color           = C.BorderColor
-    f.bs.Transparency    = C.BorderTrans
-    f.bs.Thickness       = 1
-    f.bs.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    -- Obramowanie
+    local stroke = Instance.new("UIStroke", glass)
+    stroke.Color           = CFG.BorderColor
+    stroke.Transparency    = CFG.BorderTrans
+    stroke.Thickness       = 1
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 
-    f.ab = mkFrame(f.gl, {
+    -- Pasek akcentowy (pionowy, z lewej)
+    refs.accentBar = makeFrame(glass, {
         Name             = "AccentBar",
         Size             = UDim2.new(0, 3, 1, -12),
         Position         = UDim2.fromOffset(5, 6),
@@ -194,56 +259,68 @@ local function buildUI(player, head)
         BorderSizePixel  = 0,
         ZIndex           = 3,
     })
-    Instance.new("UICorner", f.ab).CornerRadius = UDim.new(0, 3)
+    Instance.new("UICorner", refs.accentBar).CornerRadius = UDim.new(0, 3)
 
-    f.abGrad = Instance.new("UIGradient", f.ab)
-    f.abGrad.Color = ColorSequence.new({
+    refs.accentGrad = Instance.new("UIGradient", refs.accentBar)
+    refs.accentGrad.Color = ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
         ColorSequenceKeypoint.new(1, accentDark(accentColor)),
     })
-    f.abGrad.Rotation = 90
+    refs.accentGrad.Rotation = 90
 
-    f.ring = mkFrame(f.gl, {
-        Size             = UDim2.fromOffset(C.AvatarSize + 3, C.AvatarSize + 3),
+    -- Ring wokół avatara
+    refs.ring = makeFrame(glass, {
+        Size             = UDim2.fromOffset(CFG.AvatarSize + 3, CFG.AvatarSize + 3),
         Position         = UDim2.new(0, 12, 0.5, 0),
         AnchorPoint      = Vector2.new(0, 0.5),
         BackgroundColor3 = accentColor,
         BorderSizePixel  = 0,
         ZIndex           = 3,
     })
-    Instance.new("UICorner", f.ring).CornerRadius = UDim.new(1, 0)
+    Instance.new("UICorner", refs.ring).CornerRadius = UDim.new(1, 0)
 
-    f.av = Instance.new("ImageLabel", f.gl)
-    f.av.Name                   = "Avatar"
-    f.av.Size                   = UDim2.fromOffset(C.AvatarSize, C.AvatarSize)
-    f.av.Position               = UDim2.new(0, 13, 0.5, 0)
-    f.av.AnchorPoint            = Vector2.new(0, 0.5)
-    f.av.BackgroundColor3       = Color3.fromRGB(30, 30, 38)
-    f.av.BackgroundTransparency = 0
-    f.av.Image                  = ""
-    f.av.ZIndex                 = 4
-    Instance.new("UICorner", f.av).CornerRadius = UDim.new(1, 0)
+    -- Avatar
+    local avatarLabel = Instance.new("ImageLabel", glass)
+    avatarLabel.Name                   = "Avatar"
+    avatarLabel.Size                   = UDim2.fromOffset(CFG.AvatarSize, CFG.AvatarSize)
+    avatarLabel.Position               = UDim2.new(0, 13, 0.5, 0)
+    avatarLabel.AnchorPoint            = Vector2.new(0, 0.5)
+    avatarLabel.BackgroundColor3       = Color3.fromRGB(30, 30, 38)
+    avatarLabel.BackgroundTransparency = 0
+    avatarLabel.Image                  = ""
+    avatarLabel.ZIndex                 = 4
+    Instance.new("UICorner", avatarLabel).CornerRadius = UDim.new(1, 0)
 
-    local avatarAlive = true
-    task.spawn(function()
-        local ok, img = pcall(
-            S.Players.GetUserThumbnailAsync, S.Players,
-            player.UserId,
-            Enum.ThumbnailType.HeadShot,
-            Enum.ThumbnailSize.Size48x48
-        )
-        if ok and img and avatarAlive and f.av.Parent then
-            f.av.Image                  = img
-            f.av.BackgroundTransparency = 1
-        end
-    end)
+    -- Pobieranie avatara z cache lub z sieci
+    -- Cache po UserId — przy respawnie nie pobiera ponownie
+    local userId = player.UserId
+    if avatarCache[userId] then
+        avatarLabel.Image                  = avatarCache[userId]
+        avatarLabel.BackgroundTransparency = 1
+    else
+        task.spawn(function()
+            local ok, img = pcall(
+                Players.GetUserThumbnailAsync, Players,
+                userId,
+                Enum.ThumbnailType.HeadShot,
+                Enum.ThumbnailSize.Size48x48
+            )
+            -- Sprawdzamy czy label wciąż istnieje zanim ustawimy obraz
+            if ok and img and avatarLabel.Parent then
+                avatarCache[userId]                = img
+                avatarLabel.Image                  = img
+                avatarLabel.BackgroundTransparency = 1
+            end
+        end)
+    end
 
-    mkLabel(f.gl, {
+    -- Nazwa wyświetlana
+    makeLabel(glass, {
         Text                   = player.DisplayName,
-        Size                   = UDim2.fromOffset(tw, 16),
-        Position               = UDim2.fromOffset(tx, 6),
-        Font                   = C.FontMain,
-        TextColor3             = C.TextMain,
+        Size                   = UDim2.fromOffset(textWidth, 16),
+        Position               = UDim2.fromOffset(textOffset, 6),
+        Font                   = CFG.FontMain,
+        TextColor3             = CFG.TextMain,
         TextSize               = 11,
         TextScaled             = false,
         TextXAlignment         = Enum.TextXAlignment.Left,
@@ -251,12 +328,13 @@ local function buildUI(player, head)
         ZIndex                 = 4,
     })
 
-    mkLabel(f.gl, {
+    -- Username
+    makeLabel(glass, {
         Text                   = "@" .. player.Name,
-        Size                   = UDim2.fromOffset(tw, 12),
-        Position               = UDim2.fromOffset(tx, 21),
-        Font                   = C.FontSub,
-        TextColor3             = C.TextSub,
+        Size                   = UDim2.fromOffset(textWidth, 12),
+        Position               = UDim2.fromOffset(textOffset, 21),
+        Font                   = CFG.FontSub,
+        TextColor3             = CFG.TextSub,
         TextSize               = 9,
         TextScaled             = false,
         TextXAlignment         = Enum.TextXAlignment.Left,
@@ -264,26 +342,28 @@ local function buildUI(player, head)
         ZIndex                 = 4,
     })
 
-    f.sep = mkFrame(f.gl, {
-        Size                   = UDim2.new(0, tw, 0, 1),
-        Position               = UDim2.fromOffset(tx, 32),
-        BackgroundColor3       = C.SepColor,
+    -- Separator poziomy
+    local sep = makeFrame(glass, {
+        Size                   = UDim2.new(0, textWidth, 0, 1),
+        Position               = UDim2.fromOffset(textOffset, 32),
+        BackgroundColor3       = CFG.SepColor,
         BackgroundTransparency = 0,
         BorderSizePixel        = 0,
         ZIndex                 = 4,
     })
-    Instance.new("UIGradient", f.sep).Transparency = NumberSequence.new({
+    Instance.new("UIGradient", sep).Transparency = NumberSequence.new({
         NumberSequenceKeypoint.new(0,   0),
         NumberSequenceKeypoint.new(0.7, 0),
         NumberSequenceKeypoint.new(1,   1),
     })
 
-    f.dot = mkLabel(f.gl, {
+    -- Dot kolorowy (wskaźnik dystansu)
+    refs.distDot = makeLabel(glass, {
         Text                   = "●",
         Size                   = UDim2.fromOffset(10, 11),
-        Position               = UDim2.fromOffset(tx, 34),
-        Font                   = C.FontMeta,
-        TextColor3             = C.ColorClose,
+        Position               = UDim2.fromOffset(textOffset, 34),
+        Font                   = CFG.FontMeta,
+        TextColor3             = CFG.ColorClose,
         TextSize               = 7,
         TextScaled             = false,
         TextXAlignment         = Enum.TextXAlignment.Left,
@@ -291,13 +371,16 @@ local function buildUI(player, head)
         ZIndex                 = 4,
     })
 
-    f.dl = mkLabel(f.gl, {
+    -- Etykieta dystansu
+    -- Zaczyna pusta — wypełniana dopiero po pierwszym pomiarze,
+    -- żeby nie pokazywać "0 studs" przez pierwszą klatkę
+    refs.distLabel = makeLabel(glass, {
         Name                   = "Distance",
-        Text                   = "0 studs",
-        Size                   = UDim2.fromOffset(tw - 12, 11),
-        Position               = UDim2.fromOffset(tx + 11, 34),
-        Font                   = C.FontMeta,
-        TextColor3             = C.TextMeta,
+        Text                   = "",
+        Size                   = UDim2.fromOffset(textWidth - 12, 11),
+        Position               = UDim2.fromOffset(textOffset + 11, 34),
+        Font                   = CFG.FontMeta,
+        TextColor3             = CFG.TextMeta,
         TextSize               = 8,
         TextScaled             = false,
         TextXAlignment         = Enum.TextXAlignment.Left,
@@ -305,93 +388,126 @@ local function buildUI(player, head)
         ZIndex                 = 4,
     })
 
-    f.killAvatar = function() avatarAlive = false end
-    return f
+    return refs
 end
 
 -- ─────────────────────────────────────────────
---   Per-player Heartbeat
---   FIX: dystans liczony raz na klatkę
+--   Pętla per-gracz (Heartbeat)
+--   Obsługuje fade i aktualizację dystansu
 -- ─────────────────────────────────────────────
 
-local function startLoop(player, r)
-    local ct        = 1
-    local distTimer = 0
+local function startPlayerLoop(player, refs)
+    -- currentTrans zaczyna od 1 (niewidoczny) → ease-in
+    local currentTrans = 1
+    local distTimer    = 0
     local conn
-    conn = S.Run.Heartbeat:Connect(function(dt)
-        if not r.bb or not r.bb.Parent then conn:Disconnect() return end
-        local lc   = LP.Character
-        local lrp  = lc and lc:FindFirstChild("HumanoidRootPart")
-        local ch   = player.Character
-        local head = ch and ch:FindFirstChild("Head")
-        if not lrp or not head then
-            ct = lerp(ct, 1, math.min(dt * C.LerpSpeed, 1))
-            r.cv.GroupTransparency = ct
+
+    conn = RunService.Heartbeat:Connect(function(dt)
+        -- Jeśli billboard zniknął — zakończ pętlę
+        if not refs.billboard or not refs.billboard.Parent then
+            conn:Disconnect()
             return
         end
 
-        -- FIX: liczymy dystans tylko raz
-        local dist = (head.Position - lrp.Position).Magnitude
+        local lpChar = lp.Character
+        local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+        local char   = player.Character
+        local head   = char and char:FindFirstChild("Head")
 
-        -- Tekst co ~0.16s (throttle)
-        distTimer = distTimer + dt
-        if distTimer >= 0.16 then
-            distTimer = 0
-            r.dl.Text = string.format("%.0f studs", dist)
-            local dc = distColor(dist)
-            r.dot.TextColor3 = dc
-            r.dl.TextColor3  = dc
+        -- Brak postaci gracza lub naszej: ukryj płynnie
+        if not lpRoot or not head then
+            currentTrans = lerp(currentTrans, 1, math.min(dt * CFG.LerpSpeed, 1))
+            refs.canvas.GroupTransparency = currentTrans
+            return
         end
 
-        local td   = tags[player]
-        local pen  = td and td.overlapTrans or 0
-        local goal = math.max(fadeTrans(dist), pen)
-        ct = lerp(ct, goal, math.min(dt * C.LerpSpeed, 1))
-        r.cv.GroupTransparency = ct
+        -- Dystans liczony raz na klatkę
+        local dist = (head.Position - lpRoot.Position).Magnitude
+
+        -- Aktualizacja tekstu dystansu z throttlem
+        -- Tekst pojawia się dopiero po pierwszym pomiarze (nie "0 studs")
+        distTimer = distTimer + dt
+        if distTimer >= CFG.DistThrottle then
+            distTimer = 0
+            local dc = distColor(dist)
+            refs.distLabel.Text      = string.format("%.0f studs", dist)
+            refs.distDot.TextColor3  = dc
+            refs.distLabel.TextColor3 = dc
+        end
+
+        -- Przezroczystość: max z fade dystansowego i overlap penalty
+        local data       = tagData[player]
+        local overlapPen = data and data.overlapTrans or 0
+        local targetTrans = math.max(fadeTrans(dist), overlapPen)
+
+        currentTrans = lerp(currentTrans, targetTrans, math.min(dt * CFG.LerpSpeed, 1))
+        refs.canvas.GroupTransparency = currentTrans
     end)
+
     return conn
 end
 
 -- ─────────────────────────────────────────────
---   Global overlap loop
---   FIX: throttle do co 100ms zamiast 60x/s
+--   Globalny overlap loop (throttlowany)
 -- ─────────────────────────────────────────────
 
-local function startGlobal()
-    if globalLoop then globalLoop:Disconnect() end
+local function startGlobalLoop()
+    if globalLoop then
+        globalLoop:Disconnect()
+        globalLoop = nil
+    end
+
     local overlapTimer = 0
-    globalLoop = S.Run.Heartbeat:Connect(function(dt)
+
+    globalLoop = RunService.Heartbeat:Connect(function(dt)
         overlapTimer = overlapTimer + dt
-        if overlapTimer < 0.1 then return end
+        if overlapTimer < CFG.OverlapThrottle then return end
         overlapTimer = 0
 
-        local lc  = LP.Character
-        local lrp = lc and lc:FindFirstChild("HumanoidRootPart")
-        local ent = {}
-        for pl, d in tags do
-            if not d.refs then continue end
-            local ch   = pl.Character
-            local head = ch and ch:FindFirstChild("Head")
+        local lpChar = lp.Character
+        local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+
+        -- Zbierz widocznych graczy z pozycją na ekranie
+        local entries = {}
+        for pl, data in tagData do
+            if not data.refs then continue end
+            local char = pl.Character
+            local head = char and char:FindFirstChild("Head")
             if not head then continue end
-            local dist = lrp and (head.Position - lrp.Position).Magnitude or math.huge
-            table.insert(ent, { pl = pl, dist = dist, sc = w2s(head.Position + C.StudsOffset) })
+
+            local dist = lpRoot
+                and (head.Position - lpRoot.Position).Magnitude
+                or math.huge
+
+            table.insert(entries, {
+                player   = pl,
+                dist     = dist,
+                screenPos = worldToScreen(head.Position + CFG.StudsOffset),
+            })
         end
-        table.sort(ent, function(a, b) return a.dist < b.dist end)
-        for _, e in ent do
-            local d = tags[e.pl]
-            if d then d.overlapTrans = 0 end
+
+        -- Sortuj od najbliższego: bliższy gracz nie jest ukrywany przez dalszego
+        table.sort(entries, function(a, b) return a.dist < b.dist end)
+
+        -- Resetuj overlap dla wszystkich
+        for _, entry in entries do
+            local data = tagData[entry.player]
+            if data then data.overlapTrans = 0 end
         end
-        for i = 1, #ent do
-            if not ent[i].sc then continue end
-            for j = i + 1, #ent do
-                if not ent[j].sc then continue end
-                local px = (ent[i].sc - ent[j].sc).Magnitude
-                if px < C.OverlapPx then
-                    local dj = tags[ent[j].pl]
-                    if dj then
-                        dj.overlapTrans = math.max(
-                            dj.overlapTrans or 0,
-                            (1 - px / C.OverlapPx) * C.OverlapBonus
+
+        -- Wykryj nakładające się tagi (O(n²), akceptowalne dla <50 graczy)
+        for i = 1, #entries do
+            if not entries[i].screenPos then continue end
+            for j = i + 1, #entries do
+                if not entries[j].screenPos then continue end
+
+                local px = (entries[i].screenPos - entries[j].screenPos).Magnitude
+                if px < CFG.OverlapPx then
+                    local data = tagData[entries[j].player]
+                    if data then
+                        data.overlapTrans = math.max(
+                            data.overlapTrans or 0,
+                            (1 - px / CFG.OverlapPx) * CFG.OverlapBonus
                         )
                     end
                 end
@@ -401,189 +517,219 @@ local function startGlobal()
 end
 
 -- ─────────────────────────────────────────────
---   Tag lifecycle
+--   Lifecycle taga
 -- ─────────────────────────────────────────────
 
+-- Niszczy tylko UI (billboard + heartbeat), zachowuje wpis w tagData
 local function destroyTagUI(player)
-    local d = tags[player]
-    if not d then return end
-    if d.heartbeat then d.heartbeat:Disconnect() d.heartbeat = nil end
-    if d.refs and d.refs.killAvatar then d.refs.killAvatar() end
-    if d.refs and d.refs.bb and d.refs.bb.Parent then d.refs.bb:Destroy() end
-    d.refs         = nil
-    d.overlapTrans = 0
+    local data = tagData[player]
+    if not data then return end
+
+    if data.heartbeat then
+        data.heartbeat:Disconnect()
+        data.heartbeat = nil
+    end
+
+    if data.refs and data.refs.billboard and data.refs.billboard.Parent then
+        data.refs.billboard:Destroy()
+    end
+
+    data.refs         = nil
+    data.overlapTrans = 0
 end
 
+-- Niszczy wszystko włącznie z wpisem w tagData
 local function destroyTag(player)
-    local d = tags[player]
-    if not d then return end
+    local data = tagData[player]
+    if not data then return end
+
     destroyTagUI(player)
-    if d.charConn then d.charConn:Disconnect() d.charConn = nil end
-    d.watchToken = nil
-    tags[player] = nil
+
+    if data.charConn then
+        data.charConn:Disconnect()
+        data.charConn = nil
+    end
+
+    data.watchToken = nil
+    tagData[player] = nil
 end
 
 -- ─────────────────────────────────────────────
---   attachToHead
+--   Podpięcie taga pod głowę gracza
 -- ─────────────────────────────────────────────
 
 local function attachToHead(player, head)
-    local d = tags[player]
-    if not d or not enabled then return end
+    local data = tagData[player]
+    if not data or not enabled then return end
     if not head or not head.Parent then return end
 
-    -- Jeśli Adornee już wskazuje na ten Head — tylko odśwież Adornee
-    if d.refs and d.refs.bb and d.refs.bb.Parent then
-        if d.refs.bb.Adornee ~= head then
-            d.refs.bb.Adornee = head
+    -- Jeśli billboard już istnieje — tylko zaktualizuj Adornee
+    if data.refs and data.refs.billboard and data.refs.billboard.Parent then
+        if data.refs.billboard.Adornee ~= head then
+            data.refs.billboard.Adornee = head
         end
         return
     end
 
-    -- Brak refs — zbuduj od nowa
+    -- Buduj UI od nowa
     destroyTagUI(player)
+
     local ok, err = pcall(function()
-        local refs = buildUI(player, head)
-        local hb   = startLoop(player, refs)
-        d.refs      = refs
-        d.heartbeat = hb
+        local refs      = buildUI(player, head)
+        local heartbeat = startPlayerLoop(player, refs)
+        data.refs       = refs
+        data.heartbeat  = heartbeat
     end)
+
     if not ok then
-        warn("attachToHead [" .. player.Name .. "]: " .. tostring(err))
+        warn("[Nametags] attachToHead [" .. player.Name .. "]: " .. tostring(err))
     end
 end
 
 -- ─────────────────────────────────────────────
---   Watcher — polling co 0.5s
---   FIX: sprawdź najpierw, potem czekaj
---   FIX: startuje tylko gdy enabled=true
+--   Watcher — polling co WatcherInterval
+--   Wykrywa: respawn, ;char, brak postaci
+--   Startuje sprawdzenie NATYCHMIAST, potem czeka
 -- ─────────────────────────────────────────────
 
 local function startWatcher(player)
-    local d = tags[player]
-    if not d then return end
+    local data = tagData[player]
+    if not data then return end
 
+    -- Token unieważnia poprzedni watcher przy ponownym starcie
     local token = {}
-    d.watchToken = token
+    data.watchToken = token
 
     task.spawn(function()
         while true do
-            -- FIX: sprawdź NAJPIERW, task.wait na końcu
-            -- dzięki temu przy enableNametags() tagi pojawiają się natychmiast
-            local dd = tags[player]
-            if not dd or dd.watchToken ~= token or not enabled then return end
-
-            local ch   = player.Character
-            local head = ch and ch:FindFirstChild("Head")
-
-            if not ch or not head then
-                if dd.refs then destroyTagUI(player) end
-            elseif not dd.refs or not dd.refs.bb or not dd.refs.bb.Parent then
-                attachToHead(player, head)
-            elseif dd.refs.bb.Adornee ~= head then
-                dd.refs.bb.Adornee = head
+            -- Sprawdź najpierw, potem czekaj — brak opóźnienia przy enable
+            local current = tagData[player]
+            if not current or current.watchToken ~= token or not enabled then
+                return
             end
 
-            task.wait(0.5)
+            local char = player.Character
+            local head = char and char:FindFirstChild("Head")
+
+            if not char or not head then
+                -- Postać zniknęła (;char, śmierć, etc.) — zniszcz UI
+                if current.refs then
+                    destroyTagUI(player)
+                end
+            elseif not current.refs or not current.refs.billboard or not current.refs.billboard.Parent then
+                -- Postać istnieje ale brak UI — zbuduj
+                attachToHead(player, head)
+            elseif current.refs.billboard.Adornee ~= head then
+                -- Head się zmienił (nowa postać, ;char) — zaktualizuj Adornee
+                current.refs.billboard.Adornee = head
+            end
+
+            task.wait(CFG.WatcherInterval)
         end
     end)
 end
 
 -- ─────────────────────────────────────────────
---   Setup gracza
+--   Inicjalizacja gracza
 -- ─────────────────────────────────────────────
 
 local function setupPlayer(player)
-    if player == LP then return end
-    if tags[player] then return end
+    -- Pomijamy siebie
+    if player == lp then return end
+    -- Jeśli już zainicjalizowany — pomijamy (idempotent)
+    if tagData[player] then return end
 
-    tags[player] = {
+    tagData[player] = {
         refs         = nil,
         heartbeat    = nil,
         charConn     = nil,
         watchToken   = nil,
         overlapTrans = 0,
     }
-    local d = tags[player]
 
-    -- CharacterAdded: szybka ścieżka dla ;re i normalnego respawnu
-    d.charConn = player.CharacterAdded:Connect(function(newChar)
+    local data = tagData[player]
+
+    -- CharacterAdded: szybka ścieżka dla respawnu i ;char
+    data.charConn = player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
-            local head
-            local deadline = tick() + 5
-            while tick() < deadline do
-                if not tags[player] then return end
-                head = newChar:FindFirstChild("Head")
-                if head then break end
-                task.wait(0.05)
-            end
-            if not head or not tags[player] then return end
+            -- WaitForChild z timeoutem zamiast własnej pętli polling
+            local head = newChar:WaitForChild("Head", 5)
+            if not head or not tagData[player] then return end
             attachToHead(player, head)
         end)
     end)
 
-    -- Watcher startuje tylko jeśli nametagi są włączone
-    -- (jeśli wyłączone — startGlobal i watchers startną przy enableNametags)
+    -- Watcher startuje tylko gdy nametagi są włączone
     if enabled then
         startWatcher(player)
     end
 end
 
 -- ─────────────────────────────────────────────
---   Globalne API
+--   Publiczne API (przez getgenv dla Rayfield)
 -- ─────────────────────────────────────────────
 
 getgenv().enableNametags = function()
     enabled = true
-    for _, p in S.Players:GetPlayers() do
-        if p == LP then continue end
-        if not tags[p] then
-            setupPlayer(p)
-            -- setupPlayer nie startuje watchera gdy enabled=false przy init
-            -- więc startujemy go tutaj ręcznie
-            startWatcher(p)
+
+    for _, player in Players:GetPlayers() do
+        if player == lp then continue end
+
+        if not tagData[player] then
+            -- Nowy gracz — pełna inicjalizacja
+            setupPlayer(player)
+            startWatcher(player)
         else
-            local d = tags[p]
-            -- Watcher może być martwy (nil token) — wznów
-            if not d.watchToken then
-                startWatcher(p)
+            local data = tagData[player]
+            -- Watcher może być martwy — wznów go
+            if not data.watchToken then
+                startWatcher(player)
             end
         end
     end
-    startGlobal()
+
+    startGlobalLoop()
 end
 
 getgenv().disableNametags = function()
     enabled = false
-    for pl, d in tags do
-        destroyTagUI(pl)
-        d.watchToken = nil  -- zatrzymuje watcher
+
+    for player, data in tagData do
+        destroyTagUI(player)
+        data.watchToken = nil  -- zatrzymuje watcher
     end
-    if globalLoop then globalLoop:Disconnect() globalLoop = nil end
+
+    if globalLoop then
+        globalLoop:Disconnect()
+        globalLoop = nil
+    end
 end
 
+-- Aktualizuje kolor akcentu na wszystkich aktywnych tagach
 getgenv().updateNametagColor = function(color)
     accentColor = color
-    for _, d in tags do
-        if d.refs then
-            d.refs.ab.BackgroundColor3 = color
-            d.refs.abGrad.Color = ColorSequence.new({
+
+    for _, data in tagData do
+        if data.refs then
+            data.refs.accentBar.BackgroundColor3 = color
+            data.refs.accentGrad.Color = ColorSequence.new({
                 ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
                 ColorSequenceKeypoint.new(1, accentDark(color)),
             })
-            d.refs.ring.BackgroundColor3 = color
+            data.refs.ring.BackgroundColor3 = color
         end
     end
 end
 
 -- ─────────────────────────────────────────────
---   Eventy i init
+--   Zdarzenia i inicjalizacja przy ładowaniu
 -- ─────────────────────────────────────────────
 
-S.Players.PlayerAdded:Connect(setupPlayer)
-S.Players.PlayerRemoving:Connect(destroyTag)
+Players.PlayerAdded:Connect(setupPlayer)
+Players.PlayerRemoving:Connect(destroyTag)
 
+-- Inicjalizacja graczy już w grze
 task.wait(0)
-for _, p in S.Players:GetPlayers() do
-    setupPlayer(p)
+for _, player in Players:GetPlayers() do
+    setupPlayer(player)
 end
