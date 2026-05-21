@@ -1,8 +1,7 @@
 -- =============================================
---       NAMETAG SYSTEM v17.0 - Dark Theme
---       Uproszczenie: brak fade od dystansu/kamery/overlap
---       Zostaje tylko animacja toggle (masterAlpha)
---       i fade-in/out per gracz
+--       NAMETAG SYSTEM v17.1 - Dark Theme
+--       Fix: równomierne fade toggle (masterAlpha)
+--       Per-player fade tylko na spawn/despawn
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -28,13 +27,13 @@ local CFG = {
     AlwaysOnTop = true,
 
     -- Prędkość lerp przezroczystości
-    LerpSpeed       = 6,
-    -- Globalny toggle — wolniejszy dla kinowego efektu
-    ToggleLerpSpeed = 5,
+    LerpSpeed       = 10,
+    -- Globalny toggle
+    ToggleLerpSpeed = 8,
 
-    -- Fade-in/out per gracz
-    PlayerFadeInSpeed  = 4,
-    PlayerFadeOutSpeed = 5,
+    -- Fade-in/out per gracz (spawn/despawn postaci)
+    PlayerFadeInSpeed  = 6,
+    PlayerFadeOutSpeed = 7,
 
     GlassColor  = Color3.fromRGB(25, 25, 25),
     GlassTrans  = 0.12,
@@ -415,7 +414,7 @@ end
 -- ─────────────────────────────────────────────
 
 local function startPlayerLoop(player, refs)
-    local currentTrans = 1  -- startuje ukryty (fade-in)
+    local currentTrans = 1  -- startuje ukryty
     local distTimer    = 0
     local data         = tagData[player]
     local conn
@@ -431,7 +430,13 @@ local function startPlayerLoop(player, refs)
         local char   = player.Character
         local head   = char and char:FindFirstChild("Head")
 
-        -- Animacja fade per-gracz (fade-in / fade-out)
+        -- ─────────────────────────────────────────────
+        --   Per-player fade — TYLKO na spawn/despawn
+        --   Podczas toggle data.fadeState = "idle"
+        --   więc playerFade = 0 i nie blokuje masterAlpha
+        -- ─────────────────────────────────────────────
+        local playerFade = 0
+
         if data then
             if data.fadeState == "in" then
                 data.fadeAlpha = data.fadeAlpha + (0 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeInSpeed * dt))
@@ -439,6 +444,8 @@ local function startPlayerLoop(player, refs)
                     data.fadeAlpha = 0
                     data.fadeState = "idle"
                 end
+                playerFade = data.fadeAlpha
+
             elseif data.fadeState == "out" then
                 data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
                 if data.fadeAlpha > 0.995 then
@@ -457,12 +464,15 @@ local function startPlayerLoop(player, refs)
                     end
                     return
                 end
+                playerFade = data.fadeAlpha
+
+            else
+                -- idle: brak własnej animacji, masterAlpha rządzi
+                playerFade = 0
             end
         end
 
-        local playerFade = data and data.fadeAlpha or 0
-
-        -- Gdy brak postaci — trzymaj aktualny stan przez masterAlpha + playerFade
+        -- Brak postaci — trzymaj stan
         if not lpRoot or not head then
             local targetTrans = math.max(masterAlpha, playerFade)
             currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
@@ -471,7 +481,7 @@ local function startPlayerLoop(player, refs)
             return
         end
 
-        -- Dystans — tylko do etykiety, NIE wpływa na alpha
+        -- Dystans — tylko etykieta, nie wpływa na alpha
         distTimer = distTimer + dt
         if distTimer >= CFG.DistThrottle then
             distTimer = 0
@@ -483,7 +493,7 @@ local function startPlayerLoop(player, refs)
             refs.distLabel.TextColor3 = dc
         end
 
-        -- Finalna przezroczystość: tylko masterAlpha i playerFade
+        -- Finalna przezroczystość: masterAlpha + ewentualny playerFade (spawn/despawn)
         local targetTrans = math.max(masterAlpha, playerFade)
 
         currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
@@ -635,6 +645,7 @@ attachToHead = function(player, head)
     data.building = true
     destroyTagUI(player)
 
+    -- Spawn: fade-in per gracz (niezależne od toggle)
     data.fadeState = "in"
     data.fadeAlpha = 1
 
@@ -708,15 +719,35 @@ getgenv().Nametags = {
                 setupPlayer(player)
             else
                 local data = tagData[player]
-                if data.fadeState == "out" then
-                    data.fadeState = "in"
+
+                -- KLUCZOWE: przy toggle wszystkich ustawiamy w "idle"
+                -- żeby masterAlpha był jedynym sterującym
+                -- (playerFade = 0 gdy idle, wszyscy pojawiają się równomiernie)
+                if data.fadeState ~= "out" then
+                    data.fadeState = "idle"
+                    data.fadeAlpha = 0
                 end
+
                 local char = player.Character
                 local head = char and char:FindFirstChild("Head")
                 if head and not data.refs and not data.building then
-                    data.fadeState = "in"
-                    data.fadeAlpha = 1
-                    attachToHead(player, head)
+                    data.building = true
+                    destroyTagUI(player)
+                    data.fadeState = "idle"
+                    data.fadeAlpha = 0
+
+                    local ok, err = pcall(function()
+                        local refs      = buildUI(player, head)
+                        local heartbeat = startPlayerLoop(player, refs)
+                        data.refs       = refs
+                        data.heartbeat  = heartbeat
+                    end)
+
+                    data.building = false
+
+                    if not ok then
+                        warn("[Nametags] enable/attachToHead [" .. player.Name .. "]: " .. tostring(err))
+                    end
                 end
             end
         end
@@ -732,6 +763,15 @@ getgenv().Nametags = {
         if not enabled and not isTransitioning then return end
 
         isTransitioning = true
+
+        -- KLUCZOWE: wszystkich ustawiamy w idle żeby
+        -- masterAlpha sam sterował zanikaniem równomiernie
+        for _, data in tagData do
+            if data.fadeState == "in" then
+                data.fadeState = "idle"
+                data.fadeAlpha = 0
+            end
+        end
 
         animateMasterAlpha(1, CFG.ToggleLerpSpeed, function()
             if enabled then
