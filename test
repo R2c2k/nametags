@@ -1,7 +1,7 @@
 -- =============================================
---       NAMETAG SYSTEM v17.1 - Dark Theme
---       Fix: równomierne fade toggle (masterAlpha)
---       Per-player fade tylko na spawn/despawn
+--       NAMETAG SYSTEM v17.2 - Dark Theme
+--       Fix: płynne fade-in przy enable()
+--       startPlayerLoop przyjmuje initialTrans
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -411,13 +411,22 @@ end
 
 -- ─────────────────────────────────────────────
 --   Pętla per-gracz (Heartbeat)
+--   initialTrans: skąd startuje currentTrans
+--   (przy toggle = masterAlpha, przy spawn = 1)
 -- ─────────────────────────────────────────────
 
-local function startPlayerLoop(player, refs)
-    local currentTrans = 1  -- startuje ukryty
+local function startPlayerLoop(player, refs, initialTrans)
+    -- ▼ KLUCZOWA ZMIANA: startujemy z przekazanym initialTrans
+    --   Dzięki temu przy enable() wszystkie tagi startują
+    --   dokładnie z masterAlpha i lerpują razem z nim do 0
+    local currentTrans = initialTrans ~= nil and initialTrans or 1
     local distTimer    = 0
     local data         = tagData[player]
     local conn
+
+    -- Ustaw natychmiast GroupTransparency żeby nie było flash
+    if refs.canvas      then refs.canvas.GroupTransparency      = currentTrans end
+    if refs.shadowCanvas then refs.shadowCanvas.GroupTransparency = currentTrans end
 
     conn = RunService.Heartbeat:Connect(function(dt)
         if not refs.billboard or not refs.billboard.Parent then
@@ -476,7 +485,7 @@ local function startPlayerLoop(player, refs)
         if not lpRoot or not head then
             local targetTrans = math.max(masterAlpha, playerFade)
             currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
-            if refs.canvas then refs.canvas.GroupTransparency = currentTrans end
+            if refs.canvas      then refs.canvas.GroupTransparency      = currentTrans end
             if refs.shadowCanvas then refs.shadowCanvas.GroupTransparency = currentTrans end
             return
         end
@@ -497,7 +506,7 @@ local function startPlayerLoop(player, refs)
         local targetTrans = math.max(masterAlpha, playerFade)
 
         currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
-        if refs.canvas then refs.canvas.GroupTransparency = currentTrans end
+        if refs.canvas      then refs.canvas.GroupTransparency      = currentTrans end
         if refs.shadowCanvas then refs.shadowCanvas.GroupTransparency = currentTrans end
     end)
 
@@ -624,9 +633,11 @@ end
 
 -- ─────────────────────────────────────────────
 --   Podpięcie taga pod głowę
+--   toggleBuild: true = budujemy podczas toggle
+--                (startujemy z masterAlpha, nie fade-in)
 -- ─────────────────────────────────────────────
 
-attachToHead = function(player, head)
+attachToHead = function(player, head, toggleBuild)
     local data = tagData[player]
     if not data or not enabled then return end
     if not head or not head.Parent then return end
@@ -645,15 +656,28 @@ attachToHead = function(player, head)
     data.building = true
     destroyTagUI(player)
 
-    -- Spawn: fade-in per gracz (niezależne od toggle)
-    data.fadeState = "in"
-    data.fadeAlpha = 1
+    if toggleBuild then
+        -- Toggle: startujemy z masterAlpha (już animowanego),
+        -- brak własnego fade — masterAlpha ciągnie wszystkich razem
+        data.fadeState = "idle"
+        data.fadeAlpha = 0
+    else
+        -- Spawn: normalny fade-in per gracz
+        data.fadeState = "in"
+        data.fadeAlpha = 1
+    end
 
     local ok, err = pcall(function()
-        local refs      = buildUI(player, head)
-        local heartbeat = startPlayerLoop(player, refs)
-        data.refs       = refs
-        data.heartbeat  = heartbeat
+        local refs = buildUI(player, head)
+
+        -- ▼ KLUCZOWA ZMIANA: przekazujemy initialTrans
+        --   toggleBuild → startujemy z masterAlpha (płynne z resztą)
+        --   spawn       → startujemy z 1 (własna animacja fade-in)
+        local initTrans = toggleBuild and masterAlpha or 1
+        local heartbeat = startPlayerLoop(player, refs, initTrans)
+
+        data.refs      = refs
+        data.heartbeat = heartbeat
     end)
 
     data.building = false
@@ -686,7 +710,8 @@ local function setupPlayer(player)
         task.spawn(function()
             local head = newChar:WaitForChild("Head", 5)
             if not head or not tagData[player] then return end
-            attachToHead(player, head)
+            -- Normalny spawn — fade-in per gracz
+            attachToHead(player, head, false)
         end)
     end)
 
@@ -696,7 +721,7 @@ local function setupPlayer(player)
         if head then
             data.fadeState = "in"
             data.fadeAlpha = 1
-            attachToHead(player, head)
+            attachToHead(player, head, false)
         end
     end
 end
@@ -720,9 +745,7 @@ getgenv().Nametags = {
             else
                 local data = tagData[player]
 
-                -- KLUCZOWE: przy toggle wszystkich ustawiamy w "idle"
-                -- żeby masterAlpha był jedynym sterującym
-                -- (playerFade = 0 gdy idle, wszyscy pojawiają się równomiernie)
+                -- Przy toggle: idle, żeby masterAlpha sam sterował
                 if data.fadeState ~= "out" then
                     data.fadeState = "idle"
                     data.fadeAlpha = 0
@@ -731,23 +754,8 @@ getgenv().Nametags = {
                 local char = player.Character
                 local head = char and char:FindFirstChild("Head")
                 if head and not data.refs and not data.building then
-                    data.building = true
-                    destroyTagUI(player)
-                    data.fadeState = "idle"
-                    data.fadeAlpha = 0
-
-                    local ok, err = pcall(function()
-                        local refs      = buildUI(player, head)
-                        local heartbeat = startPlayerLoop(player, refs)
-                        data.refs       = refs
-                        data.heartbeat  = heartbeat
-                    end)
-
-                    data.building = false
-
-                    if not ok then
-                        warn("[Nametags] enable/attachToHead [" .. player.Name .. "]: " .. tostring(err))
-                    end
+                    -- toggleBuild = true → startuje z masterAlpha
+                    attachToHead(player, head, true)
                 end
             end
         end
@@ -764,7 +772,7 @@ getgenv().Nametags = {
 
         isTransitioning = true
 
-        -- KLUCZOWE: wszystkich ustawiamy w idle żeby
+        -- Wszystkich ustawiamy w idle żeby
         -- masterAlpha sam sterował zanikaniem równomiernie
         for _, data in tagData do
             if data.fadeState == "in" then
