@@ -1,8 +1,8 @@
 -- =============================================
---       NAMETAG SYSTEM v18.0 - Dark Theme
---       Rewrite: jedna globalna pętla HB,
---       CharacterRemoving, brak globalWatcher,
---       DRY setup, poprawiony disable flow
+--       NAMETAG SYSTEM v19.0 - Dark Theme
+--       Fixes: nowi gracze, sync toggle fade,
+--       destroyTagUI flash, lerp-of-lerp,
+--       accentGrad, zombie billboardy
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -35,10 +35,12 @@ local CFG = {
     AlwaysOnTop = true,
 
     -- Prędkości lerpa
-    LerpSpeed       = 10,   -- per-tag (canvas → masterAlpha)
-    ToggleLerpSpeed = 8,    -- masterAlpha przy toggle
-    PlayerFadeInSpeed  = 6, -- fade-in po spawnie postaci
-    PlayerFadeOutSpeed = 7, -- fade-out po despawnie / wylogowaniu
+    -- LerpSpeed używany TYLKO przy per-player fade (spawn/despawn)
+    -- Podczas toggle masterAlpha jest jedynym źródłem prawdy — brak dodatkowego lerpa
+    LerpSpeed          = 10,  -- per-player fade (spawn/despawn)
+    ToggleLerpSpeed    = 8,   -- masterAlpha przy toggle
+    PlayerFadeInSpeed  = 6,   -- fade-in po spawnie postaci
+    PlayerFadeOutSpeed = 7,   -- fade-out po despawnie / wylogowaniu
 
     -- Kolory tła
     GlassColor  = Color3.fromRGB(25, 25, 25),
@@ -48,8 +50,8 @@ local CFG = {
     ShadowColor = Color3.fromRGB(0, 0, 0),
     ShadowTrans = 0.55,
 
-    -- Domyślny akcent (można zmienić setColor)
-    Accent   = Color3.fromRGB(0, 160, 255),
+    -- Domyślny akcent
+    Accent = Color3.fromRGB(0, 160, 255),
 
     -- Kolory tekstu
     TextMain = Color3.fromRGB(240, 240, 240),
@@ -86,19 +88,19 @@ local accentColor = CFG.Accent
 local masterAlpha     = 1
 local masterAlphaConn = nil
 
--- Jedna globalna pętla Heartbeat zamiast N osobnych
 local globalHeartbeat = nil
 
 local avatarCache = {}  -- [userId] = imageUrl
-local widthCache  = {}  -- [userId] = number (czyści się przy FULL disable, nie przy despawnie)
+local widthCache  = {}  -- [userId] = number
 
 -- tagData[player] = {
---   refs       = { billboard, shadowBB, canvas, shadowCanvas, ... } | nil
---   charConns  = { added, removing }  -- tablica połączeń postaci
---   fadeState  = "idle" | "in" | "out"
---   fadeAlpha  = number (0 = widoczny, 1 = ukryty)
---   building   = bool
---   distTimer  = number
+--   refs         = { billboard, shadowBB, canvas, shadowCanvas, ... } | nil
+--   charConns    = { conn, conn }
+--   fadeState    = "idle" | "in" | "out"
+--   fadeAlpha    = number (0 = widoczny, 1 = ukryty)
+--   currentTrans = number  -- używane tylko podczas per-player fade
+--   building     = bool
+--   distTimer    = number
 -- }
 local tagData = {}
 
@@ -106,10 +108,10 @@ local tagData = {}
 --   Kontener GUI
 -- ─────────────────────────────────────────────
 
-local tagContainer = CoreGui:FindFirstChild("NametagContainer_v18")
+local tagContainer = CoreGui:FindFirstChild("NametagContainer_v19")
 if not tagContainer then
     tagContainer      = Instance.new("Folder")
-    tagContainer.Name = "NametagContainer_v18"
+    tagContainer.Name = "NametagContainer_v19"
     tagContainer.Parent = CoreGui
 end
 
@@ -121,6 +123,7 @@ local exp    = math.exp
 local abs    = math.abs
 local clamp  = math.clamp
 local floor  = math.floor
+local max    = math.max
 local format = string.format
 
 local function lerpColor(c1, c2, t)
@@ -146,13 +149,24 @@ local function distColor(d)
     end
 end
 
-local function accentDark(color)
-    return Color3.new(color.R * 0.6, color.G * 0.6, color.B * 0.6)
+-- FIX: poprawny gradient — rozjaśniamy kolor zamiast hardkodować biały keypoint 0
+local function accentGradientColor(color)
+    return ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.new(
+            math.min(color.R * 1.35, 1),
+            math.min(color.G * 1.35, 1),
+            math.min(color.B * 1.35, 1)
+        )),
+        ColorSequenceKeypoint.new(1, Color3.new(
+            color.R * 0.55,
+            color.G * 0.55,
+            color.B * 0.55
+        )),
+    })
 end
 
 local function calcWidth(player)
     local userId = player.UserId
-    -- Cache żyje przez cały czas działania systemu
     if widthCache[userId] then return widthCache[userId] end
 
     local dispName     = player.DisplayName
@@ -267,11 +281,10 @@ local function buildUI(player, head)
     })
     glassGrad.Rotation = 90
 
-    -- Bordera robimy jako UIStroke zamiast dwóch Frame'ów
     local uiStroke = Instance.new("UIStroke", glass)
-    uiStroke.Color       = CFG.BorderColor
-    uiStroke.Transparency = CFG.BorderTrans
-    uiStroke.Thickness   = 1
+    uiStroke.Color           = CFG.BorderColor
+    uiStroke.Transparency    = CFG.BorderTrans
+    uiStroke.Thickness       = 1
     uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 
     -- ── Accent bar ────────────────────────────
@@ -286,10 +299,7 @@ local function buildUI(player, head)
     refs.accentBar = accentBar
 
     local accentGrad = Instance.new("UIGradient", accentBar)
-    accentGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-        ColorSequenceKeypoint.new(1, accentDark(accentColor)),
-    })
+    accentGrad.Color    = accentGradientColor(accentColor)  -- FIX: poprawna funkcja
     accentGrad.Rotation = 90
     refs.accentGrad = accentGrad
 
@@ -314,9 +324,8 @@ local function buildUI(player, head)
     avatarLabel.ZIndex                 = 4
     Instance.new("UICorner", avatarLabel).CornerRadius = UDim.new(1, 0)
 
-    -- Bezpieczne ładowanie avatara — sprawdzamy czy tag nadal istnieje
     local userId  = player.UserId
-    local tagSnap = tagData[player]  -- snapshot referencji na czas spawnu
+    local tagSnap = tagData[player]
 
     if avatarCache[userId] then
         avatarLabel.Image                  = avatarCache[userId]
@@ -329,7 +338,6 @@ local function buildUI(player, head)
                 Enum.ThumbnailType.HeadShot,
                 Enum.ThumbnailSize.Size48x48
             )
-            -- Sprawdź czy ten konkretny tag nadal żyje
             if ok and img
                 and avatarLabel.Parent
                 and tagData[player] == tagSnap
@@ -442,7 +450,7 @@ end
 
 -- ─────────────────────────────────────────────
 --   Niszczenie UI taga
---   withFade: true  = płynny fade-out przed destroy
+--   withFade: true  = płynny fade-out przed destroy (przez globalny HB)
 --            false = natychmiastowe usunięcie
 -- ─────────────────────────────────────────────
 
@@ -451,9 +459,10 @@ local function destroyTagUI(player, withFade)
     if not data then return end
 
     if withFade and data.refs then
-        -- Tylko ustaw fadeState, globalna pętla HB ogarnie resztę
+        -- FIX: nie resetujemy fadeAlpha do 0 — zaczynamy fade-out od aktualnej wartości
+        -- żeby nie było flasha. Globalny HB ogarnie resztę.
         data.fadeState = "out"
-        data.fadeAlpha = data.fadeAlpha < 0.99 and data.fadeAlpha or 0
+        -- fadeAlpha zostawiamy na aktualnym poziomie (nie dotykamy)
     else
         -- Natychmiastowe zniszczenie
         if data.refs then
@@ -465,18 +474,19 @@ local function destroyTagUI(player, withFade)
             end
             data.refs = nil
         end
-        data.fadeState = "idle"
-        data.fadeAlpha = 1
-        data.building  = false
+        data.fadeState   = "idle"
+        data.fadeAlpha   = 1
+        data.currentTrans = 1
+        data.building    = false
     end
 end
 
 -- ─────────────────────────────────────────────
 --   Podpięcie taga pod głowę
---   toggleBuild: true = budujemy podczas toggle enable
---                      → startujemy z masterAlpha, brak własnego fade-in
---               false = normalny spawn postaci
---                      → startujemy z 1, własny fade-in
+--   toggleBuild: true  = budujemy podczas toggle enable
+--                       → startujemy z masterAlpha, brak własnego fade-in
+--               false  = normalny spawn postaci
+--                       → startujemy z 1, własny fade-in
 -- ─────────────────────────────────────────────
 
 local function attachToHead(player, head, toggleBuild)
@@ -499,30 +509,38 @@ local function attachToHead(player, head, toggleBuild)
 
     data.building = true
 
-    -- Zniszcz stary UI jeśli coś zostało
-    destroyTagUI(player, false)
-
-    if toggleBuild then
-        data.fadeState = "idle"
-        data.fadeAlpha = 0
-    else
-        data.fadeState = "in"
-        data.fadeAlpha = 1
+    -- Zniszcz stary UI bez fade (jeśli coś zostało)
+    if data.refs then
+        if data.refs.billboard and data.refs.billboard.Parent then
+            pcall(function() data.refs.billboard:Destroy() end)
+        end
+        if data.refs.shadowBB and data.refs.shadowBB.Parent then
+            pcall(function() data.refs.shadowBB:Destroy() end)
+        end
+        data.refs = nil
     end
 
-    -- initialTrans: toggleBuild → startujemy z aktualnego masterAlpha (brak skoku)
-    --               spawn       → startujemy z 1 (własny fade-in)
-    local initTrans = toggleBuild and masterAlpha or 1
+    if toggleBuild then
+        -- Toggle: masterAlpha jest jedynym sterownikiem — fadeState idle, playerFade = 0
+        data.fadeState    = "idle"
+        data.fadeAlpha    = 0
+        data.currentTrans = masterAlpha
+    else
+        -- Spawn: własny fade-in od 1 do 0
+        data.fadeState    = "in"
+        data.fadeAlpha    = 1
+        data.currentTrans = 1
+    end
+
+    local initTrans = data.currentTrans
 
     local ok, err = pcall(function()
         local refs = buildUI(player, head)
 
-        -- Ustaw GroupTransparency natychmiast zanim globalny HB zdąży iterować
-        refs.canvas.GroupTransparency      = initTrans
+        -- Ustaw GroupTransparency natychmiast — brak skoku przy pierwszej klatce HB
+        refs.canvas.GroupTransparency       = initTrans
         refs.shadowCanvas.GroupTransparency = initTrans
 
-        -- Zapisz initTrans do danych (używane przez globalny HB)
-        data.currentTrans = initTrans
         data.refs = refs
     end)
 
@@ -535,7 +553,11 @@ end
 
 -- ─────────────────────────────────────────────
 --   Globalna pętla Heartbeat
---   JEDNA dla wszystkich graczy — zamiast N osobnych
+--   JEDNA dla wszystkich graczy
+--
+--   FIX: Per-player lerp TYLKO przy własnym fade (spawn/despawn).
+--   Podczas toggle (fadeState == "idle") — bezpośrednio masterAlpha
+--   bez dodatkowego lerpa. Wszystkie tagi idle poruszają się SYNCHRONICZNIE.
 -- ─────────────────────────────────────────────
 
 local function startGlobalHeartbeat()
@@ -553,32 +575,32 @@ local function startGlobalHeartbeat()
 
             local refs = data.refs
             if not refs.billboard or not refs.billboard.Parent then
-                -- Billboard zniknął z zewnątrz — wyczyść refs
-                data.refs      = nil
-                data.fadeState = "idle"
-                data.fadeAlpha = 1
+                -- Billboard zniknął z zewnątrz — wyczyść refs (anti-zombie)
+                data.refs         = nil
+                data.fadeState    = "idle"
+                data.fadeAlpha    = 1
                 data.currentTrans = 1
                 continue
             end
 
-            -- ── Per-player fade (spawn/despawn) ──
-            local playerFade = 0
-            local fadeState  = data.fadeState
+            -- ── Per-player fade (spawn/despawn) ──────────
+            local fadeState = data.fadeState
 
             if fadeState == "in" then
+                -- Lerp fadeAlpha: 1 → 0
                 data.fadeAlpha = data.fadeAlpha + (0 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeInSpeed * dt))
                 if abs(data.fadeAlpha) < 0.005 then
                     data.fadeAlpha = 0
                     data.fadeState = "idle"
                 end
-                playerFade = data.fadeAlpha
 
             elseif fadeState == "out" then
+                -- Lerp fadeAlpha: aktualna → 1
                 data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
                 if data.fadeAlpha > 0.995 then
                     -- Fade-out zakończony — zniszcz UI
-                    data.fadeAlpha = 1
-                    data.fadeState = "idle"
+                    data.fadeAlpha    = 1
+                    data.fadeState    = "idle"
                     data.currentTrans = 1
                     if refs.billboard and refs.billboard.Parent then
                         pcall(function() refs.billboard:Destroy() end)
@@ -589,11 +611,36 @@ local function startGlobalHeartbeat()
                     data.refs = nil
                     continue
                 end
-                playerFade = data.fadeAlpha
             end
-            -- fadeState == "idle" → playerFade = 0, masterAlpha rządzi
 
-            -- ── Dystans ───────────────────────────
+            -- ── Finalna przezroczystość ───────────────────
+            --
+            -- FIX: Kluczowa zmiana względem v18.
+            -- fadeState == "idle"  → bezpośrednio masterAlpha (synchroniczne z innymi)
+            -- fadeState == "in/out" → lerp per-player od currentTrans → max(masterAlpha, fadeAlpha)
+            --
+            -- Efekt: podczas toggle wszystkie tagi poruszają się razem (jeden lerp = masterAlpha).
+            -- Podczas spawn/despawn konkretnego gracza — własny, niezależny lerp.
+
+            local finalTrans
+
+            if fadeState == "idle" then
+                -- Bez per-tag lerpa — masterAlpha jest tu jedynym źródłem prawdy
+                finalTrans        = masterAlpha
+                data.currentTrans = finalTrans
+            else
+                -- Per-player fade: max(masterAlpha, fadeAlpha) z własnym lerpem
+                local targetTrans = max(masterAlpha, data.fadeAlpha)
+                local cur         = data.currentTrans
+                cur               = cur + (targetTrans - cur) * (1 - exp(-CFG.LerpSpeed * dt))
+                data.currentTrans = cur
+                finalTrans        = cur
+            end
+
+            refs.canvas.GroupTransparency       = finalTrans
+            refs.shadowCanvas.GroupTransparency = finalTrans
+
+            -- ── Dystans ───────────────────────────────────
             local char = player.Character
             local head = char and char:FindFirstChild("Head")
 
@@ -608,16 +655,6 @@ local function startGlobalHeartbeat()
                     refs.distLabel.TextColor3 = dc
                 end
             end
-
-            -- ── Finalna przezroczystość ────────────
-            -- max: gdy masterAlpha = 1 (ukryty) LUB playerFade = 1 → ukryty
-            local targetTrans    = masterAlpha > playerFade and masterAlpha or playerFade
-            local currentTrans   = data.currentTrans or targetTrans
-            currentTrans         = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
-            data.currentTrans    = currentTrans
-
-            refs.canvas.GroupTransparency      = currentTrans
-            refs.shadowCanvas.GroupTransparency = currentTrans
         end
     end)
 end
@@ -630,7 +667,6 @@ local function cleanupPlayer(player)
     local data = tagData[player]
     if not data then return end
 
-    -- Rozłącz eventy postaci
     if data.charConns then
         for _, conn in data.charConns do
             conn:Disconnect()
@@ -638,7 +674,6 @@ local function cleanupPlayer(player)
         data.charConns = nil
     end
 
-    -- Zniszcz UI natychmiast (nie fade — gracz wychodzi)
     destroyTagUI(player, false)
 
     widthCache[player.UserId] = nil
@@ -650,44 +685,45 @@ local function setupPlayer(player)
     if tagData[player] then return end
 
     tagData[player] = {
-        refs       = nil,
-        charConns  = nil,
-        fadeState  = "idle",
-        fadeAlpha  = 1,
-        building   = false,
-        distTimer  = 0,
+        refs         = nil,
+        charConns    = nil,
+        fadeState    = "idle",
+        fadeAlpha    = 1,
+        building     = false,
+        distTimer    = 0,
         currentTrans = 1,
     }
 
     local data = tagData[player]
 
+    -- FIX: sprawdzenie `enabled` wewnątrz CharacterAdded — bez tego nowi gracze
+    -- mogą dostawać zombie-tagi gdy system jest wyłączony
     local charAdded = player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
             local head = newChar:WaitForChild("Head", 5)
             if not head or not tagData[player] then return end
-            -- Zawsze normalny fade-in przy spawnie postaci
+            if not enabled then return end  -- ← KLUCZOWY FIX
             attachToHead(player, head, false)
         end)
     end)
 
-    -- CharacterRemoving — od razu fade-out przy despawnie
+    -- CharacterRemoving — fade-out przy despawnie
+    -- FIX: nie resetujemy fadeAlpha do 0 — zaczynamy od aktualnej wartości
     local charRemoving = player.CharacterRemoving:Connect(function()
         local d = tagData[player]
         if d and d.refs then
             d.fadeState = "out"
-            d.fadeAlpha = d.fadeAlpha < 0.99 and d.fadeAlpha or 0
+            -- fadeAlpha zostaje na aktualnej wartości — bez flasha
         end
     end)
 
     data.charConns = { charAdded, charRemoving }
 
-    -- Jeśli postać już istnieje w momencie setupu
+    -- Jeśli postać już istnieje w momencie setupu i system jest włączony
     if enabled then
         local char = player.Character
         local head = char and char:FindFirstChild("Head")
         if head then
-            data.fadeState = "in"
-            data.fadeAlpha = 1
             attachToHead(player, head, false)
         end
     end
@@ -705,24 +741,21 @@ getgenv().Nametags = {
         isTransitioning = true
         enabled = true
 
-        -- Zatrzymaj animację masterAlpha jeśli trwa
         if masterAlphaConn then
             masterAlphaConn:Disconnect()
             masterAlphaConn = nil
         end
-        -- Zresetuj masterAlpha do 1 (wszystko ukryte) — brak flasha
+        -- Reset do 1 — wszystkie tagi startują jako ukryte, razem fade-in przez masterAlpha
         masterAlpha = 1
 
-        -- Zainicjalizuj globalną pętlę HB (jedna dla wszystkich)
+        -- Globalna pętla HB musi działać zanim zaczniemy budować tagi
         startGlobalHeartbeat()
 
-        -- Zbuduj UI dla wszystkich obecnych graczy synchronicznie
-        -- Wszystkie tagi startują z GroupTransparency = 1
-        -- a masterAlpha animuje je razem do 0
+        -- Zbuduj UI dla wszystkich obecnych graczy
+        -- toggleBuild = true → fadeState idle, masterAlpha steruje wszystkimi synchronicznie
         for _, player in Players:GetPlayers() do
             if player == lp then continue end
 
-            -- Upewnij się że gracz ma wpis w tagData
             if not tagData[player] then
                 setupPlayer(player)
             end
@@ -731,42 +764,37 @@ getgenv().Nametags = {
             if not data then continue end
             if data.fadeState == "out" then continue end
 
-            -- Ustaw idle → masterAlpha steruje wszystkim
-            data.fadeState   = "idle"
-            data.fadeAlpha   = 0
+            -- Reset stanu przed budową
+            data.fadeState    = "idle"
+            data.fadeAlpha    = 0
             data.currentTrans = 1
 
             local char = player.Character
             local head = char and char:FindFirstChild("Head")
 
             if head and not data.building then
-                -- Buduj z initTrans = 1, fadeState = "idle"
-                -- (toggleBuild = true → brak per-player fade-in, masterAlpha ciągnie wszystkich)
                 attachToHead(player, head, true)
             elseif data.refs then
-                -- Tag już istnieje — upewnij się że jest ukryty przed animacją
-                data.refs.canvas.GroupTransparency      = 1
+                -- Tag już istnieje — ukryj przed animacją
+                data.refs.canvas.GroupTransparency       = 1
                 data.refs.shadowCanvas.GroupTransparency = 1
                 data.currentTrans = 1
             end
         end
 
-        -- Wszyscy gotowi i ukryci — odpal fade-in przez masterAlpha
+        -- Wszyscy gotowi i ukryci — odpal synchroniczny fade-in
         animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
             isTransitioning = false
         end)
     end,
 
     disable = function()
-        -- Poprawiona kolejność: najpierw enabled = false,
-        -- potem animacja — callback wie że system jest wyłączony
         if not enabled and not isTransitioning then return end
 
         enabled = false
         isTransitioning = true
 
-        -- Wszystkie per-player fade-in'y zatrzymaj
-        -- żeby masterAlpha był jedynym sterującym podczas fade-out
+        -- Zatrzymaj wszystkie per-player fade-in żeby masterAlpha był jedynym sterownikiem
         for _, data in tagData do
             if data.fadeState == "in" then
                 data.fadeState = "idle"
@@ -777,33 +805,32 @@ getgenv().Nametags = {
         animateMasterAlpha(1, CFG.ToggleLerpSpeed, function()
             isTransitioning = false
 
-            -- Zatrzymaj globalny HB
+            -- FIX: Najpierw zatrzymaj HB — potem niszcz UI
+            -- Dzięki temu HB nie może tworzyć zombie podczas czyszczenia
             if globalHeartbeat then
                 globalHeartbeat:Disconnect()
                 globalHeartbeat = nil
             end
 
-            -- Zniszcz wszystkie UI
+            -- Zniszcz wszystkie UI natychmiast (masterAlpha = 1, już ukryte)
             for player, _ in tagData do
                 destroyTagUI(player, false)
             end
 
-            -- Wyczyść widthCache przy pełnym disable
             widthCache = {}
         end)
     end,
 
+    -- FIX: poprawna funkcja gradientu — kolor zależy od przekazanego koloru
     setColor = function(color)
         accentColor = color
+        local newGradient = accentGradientColor(color)
         for _, data in tagData do
             if data.refs then
                 local refs = data.refs
                 refs.accentBar.BackgroundColor3 = color
-                refs.accentGrad.Color = ColorSequence.new({
-                    ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-                    ColorSequenceKeypoint.new(1, accentDark(color)),
-                })
-                refs.ring.BackgroundColor3 = color
+                refs.accentGrad.Color           = newGradient
+                refs.ring.BackgroundColor3      = color
             end
         end
     end,
@@ -824,10 +851,10 @@ Players.PlayerRemoving:Connect(function(player)
     local data = tagData[player]
     if not data then return end
 
-    -- Fade-out a potem cleanup z opóźnieniem (czas na animację)
     if data.refs then
         destroyTagUI(player, true)
-        task.delay(1.5, function()
+        -- Czas na fade-out (~0.6s przy PlayerFadeOutSpeed=7) + margines
+        task.delay(1.2, function()
             cleanupPlayer(player)
         end)
     else
