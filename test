@@ -738,28 +738,84 @@ getgenv().Nametags = {
         isTransitioning = true
         enabled = true
 
+        -- Krok 1: upewnij się że masterAlpha = 1 (wszystko ukryte)
+        -- żeby żaden tag nie mignął przed startem animacji
+        if masterAlphaConn then
+            masterAlphaConn:Disconnect()
+            masterAlphaConn = nil
+        end
+        masterAlpha = 1
+
+        -- Krok 2: zbuduj UI dla WSZYSTKICH graczy synchronicznie
+        -- Wszystkie startują z GroupTransparency = 1 (niewidoczne)
+        -- Animacja NIE startuje dopóki wszystkie tagi nie są gotowe
         for _, player in Players:GetPlayers() do
             if player == lp then continue end
+
             if not tagData[player] then
-                setupPlayer(player)
-            else
+                -- Inicjalizuj dane gracza (bez attachToHead — zrobimy to niżej)
+                tagData[player] = {
+                    refs       = nil,
+                    heartbeat  = nil,
+                    charConn   = nil,
+                    fadeState  = "idle",
+                    fadeAlpha  = 0,
+                    building   = false,
+                }
                 local data = tagData[player]
+                data.charConn = player.CharacterAdded:Connect(function(newChar)
+                    task.spawn(function()
+                        local head = newChar:WaitForChild("Head", 5)
+                        if not head or not tagData[player] then return end
+                        attachToHead(player, head, false)
+                    end)
+                end)
+            end
 
-                -- Przy toggle: idle, żeby masterAlpha sam sterował
-                if data.fadeState ~= "out" then
-                    data.fadeState = "idle"
-                    data.fadeAlpha = 0
+            local data = tagData[player]
+
+            -- Jeśli trwa fade-out, zostaw go — nie przerywaj
+            if data.fadeState == "out" then continue end
+
+            -- Ustaw idle żeby masterAlpha był jedynym sterującym
+            data.fadeState = "idle"
+            data.fadeAlpha = 0
+
+            local char = player.Character
+            local head = char and char:FindFirstChild("Head")
+
+            if head and not data.refs and not data.building then
+                -- Buduj synchronicznie z initialTrans = 1 (ukryty)
+                -- masterAlpha też jest 1 więc brak skoku
+                data.building = true
+                destroyTagUI(player)
+                data.fadeState = "idle"
+                data.fadeAlpha = 0
+
+                local ok, err = pcall(function()
+                    local refs      = buildUI(player, head)
+                    local heartbeat = startPlayerLoop(player, refs, 1)
+                    data.refs       = refs
+                    data.heartbeat  = heartbeat
+                end)
+                data.building = false
+
+                if not ok then
+                    warn("[Nametags] enable build [" .. player.Name .. "]: " .. tostring(err))
                 end
-
-                local char = player.Character
-                local head = char and char:FindFirstChild("Head")
-                if head and not data.refs and not data.building then
-                    -- toggleBuild = true → startuje z masterAlpha
-                    attachToHead(player, head, true)
+            elseif data.refs then
+                -- Tag już istnieje (re-enable po disable) —
+                -- upewnij się że GroupTransparency = 1 przed animacją
+                if data.refs.canvas then
+                    data.refs.canvas.GroupTransparency = 1
+                end
+                if data.refs.shadowCanvas then
+                    data.refs.shadowCanvas.GroupTransparency = 1
                 end
             end
         end
 
+        -- Krok 3: wszystkie tagi gotowe i ukryte — teraz odpal animację
         startGlobalWatcher()
 
         animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
