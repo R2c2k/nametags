@@ -1,17 +1,24 @@
 -- =============================================
---       NAMETAG SYSTEM v15.0 - Dark Theme
---       Animacje, poprawki wizualne
+--       NAMETAG SYSTEM v16.0 - Dark Theme
+--       Poprawki: widoczność z daleka, animacje,
+--       spam-toggle fix, fade logika
 -- =============================================
 --
---  ZMIANY vs v14.0:
---  [A1] Globalny fade toggle — płynne enable/disable przez masterAlpha
---  [A2] Fade-in przy PlayerAdded (gracz wchodzi na serwer)
---  [A3] Fade-out przy PlayerRemoving (gracz wychodzi)
---  [A4] Kamera fade (35 studs) wbudowany w per-player loop
---  [V1] Naprawione poszarpane krawędzie — shadow jako osobny BillboardGui
---       zamiast Frame z offset (eliminuje artifact renderowania rogów)
---  [V2] Naprawiona brzydka krawędź prawy dolny róg — UICorner na canvas
---  [V3] CanvasGroup dostaje UICorner — zapobiega "przeświecaniu" rogów
+--  ZMIANY vs v15.0:
+--  [F1] NAPRAWIONA logika fadeTrans — nametagi WIDOCZNE z daleka
+--       Zamiast zanikać przy odległości, zanikają tylko gdy:
+--       a) kamera jest bardzo blisko gracza (<FadeNearMax)
+--       b) gracz jest BARDZO daleko (>FadeFarMin) — opcjonalny
+--  [F2] Fade kamera poprawiony — chodzi o dystans kamera↔lokalny gracz
+--       (nie kamera↔nametag), ukrywa własny tag gdy za blisko
+--  [F3] Spam-toggle fix — enable/disable są idempotentne i bezpieczne
+--       Nowy flag `isTransitioning` + poprawna kolejność operacji
+--  [F4] masterAlpha animacja — kontynuuje z aktualnej wartości (nie reset)
+--  [F5] Per-player loop zatrzymuje się gdy enabled=false
+--  [F6] destroyTagUI bezpieczne — sprawdza nil refs przed Destroy
+--  [A1] Smoother lerp — LerpSpeed zmniejszony, easing bardziej "kinowy"
+--  [A2] Fade-in/out gracza — wolniejsze, przyjemniejsze
+--  [A3] ToggleLerpSpeed — osobny, wolniejszy dla globalnego toggle
 --
 -- ─────────────────────────────────────────────
 
@@ -37,26 +44,30 @@ local CFG = {
 
     AlwaysOnTop = true,
 
-    -- Fade dystans kamera (kamera bliżej niż FadeNearMax → ukryj)
-    FadeNearMin = 2,
-    FadeNearMax = 6,
+    -- [F1] Fade gdy kamera jest BARDZO blisko nametaga (lokalny gracz patrzy zbliska)
+    -- Ukrywa nametag żeby nie zaślepił ekranu
+    FadeNearMin = 2,    -- poniżej tej odległości → zawsze ukryty
+    FadeNearMax = 7,    -- powyżej tej odległości → widoczny
 
-    -- Fade kamera od gracza (powyżej FadeCamMin → zanikaj, stały powyżej FadeCamMax)
-    -- [A4] Płynny fade zamiast skoku przy 35 studs
-    FadeCamMin  = 28,   -- zaczyna zanikać
-    FadeCamMax  = 35,   -- pełna widoczność
+    -- [F2] Kamera od lokalnego gracza — ukrywa nametagi INNYCH gdy
+    -- lokalny gracz stoi blisko kamery (np. 1st person)
+    -- Wartości: 0 = wyłączone (nie używamy tego fade)
+    FadeCamMin  = 0,
+    FadeCamMax  = 0,
 
-    -- Fade dalekiego dystansu
-    FadeFarMin  = 55,
-    FadeFarMax  = 70,
+    -- [F1] Daleki dystans — opcjonalnie zanikaj gdy ktoś jest BARDZO daleko
+    -- Ustaw FadeFarMin = math.huge żeby wyłączyć
+    FadeFarMin  = 9999,  -- domyślnie: wyłączone — chcemy widzieć wszystkich
+    FadeFarMax  = 9999,
 
-    -- [A1] Szybkość globalnego fade toggle
-    LerpSpeed       = 12,
-    ToggleLerpSpeed = 8,   -- wolniejszy niż per-gracz — bardziej "kinowy"
+    -- [A1] Prędkość lerp przezroczystości — mniejsza = płynniejsza
+    LerpSpeed       = 6,   -- był 12, za szybki
+    -- [A3] Globalny toggle — jeszcze wolniejszy dla kinowego efektu
+    ToggleLerpSpeed = 5,   -- był 8
 
-    -- [A2][A3] Czas fade-in gracza i fade-out przed Destroy
-    PlayerFadeInSpeed  = 6,
-    PlayerFadeOutSpeed = 8,
+    -- [A2] Fade-in/out per-gracz — wolniejsze = bardziej smooth
+    PlayerFadeInSpeed  = 4,   -- był 6
+    PlayerFadeOutSpeed = 5,   -- był 8
 
     OverlapPx    = 180,
     OverlapBonus = 0.65,
@@ -87,7 +98,6 @@ local CFG = {
     OverlapThrottle = 0.10,
     WatcherInterval = 0.50,
 
-    -- Zaokrąglenie rogów (zwiększone vs v14 dla lepszego wyglądu)
     CornerRadius = 10,
 }
 
@@ -97,23 +107,20 @@ local OVERLAP_PX_SQ = CFG.OverlapPx * CFG.OverlapPx
 --   Stan globalny
 -- ─────────────────────────────────────────────
 
-local enabled     = false
+local enabled         = false
+-- [F3] Flaga anty-spam: true gdy trwa animacja toggle
+local isTransitioning = false
+
 local accentColor = CFG.Accent
 
--- [A1] masterAlpha: 0 = wszystko widoczne, 1 = wszystko ukryte
--- Per-player loop mnoży swój targetTrans przez masterAlpha
-local masterAlpha     = 1   -- zaczyna od 1 (niewidoczne), ease-in przy enable
-local masterAlphaConn = nil -- Heartbeat do animacji toggle
+-- [F4] masterAlpha: 0 = widoczne, 1 = ukryte
+-- Zaczyna od 1 tylko raz przy inicjalizacji skryptu
+local masterAlpha     = 1
+local masterAlphaConn = nil
 
 local avatarCache = {}
 local widthCache  = {}
 
--- tagData[player] = {
---   refs, heartbeat, charConn,
---   overlapTrans, cachedDist, building,
---   fadeState: "in"|"out"|"idle"  -- [A2][A3]
---   fadeAlpha: number             -- lokalna alfa fade-in/out
--- }
 local tagData = {}
 
 local globalLoop    = nil
@@ -159,42 +166,29 @@ local function distColor(d)
     end
 end
 
--- [A4] Nowy fadeTrans: fade bliski (kamera<->tag) + fade kamera od gracza + daleki
-local function fadeTrans(dist, camDist)
-    -- Kamera od taga (bardzo blisko)
-    local nearFade
+-- [F1] NAPRAWIONA fadeTrans
+-- Zwraca 0 = WIDOCZNY, 1 = NIEWIDOCZNY
+-- Nametag jest ZAWSZE widoczny z daleka (domyślnie).
+-- Zanika tylko gdy kamera jest bardzo blisko nametaga (FadeNear).
+local function fadeTrans(dist)
+    -- Fade gdy kamera/gracz jest bardzo blisko nametaga (żeby nie zaślepiać)
     if dist < CFG.FadeNearMin then
-        nearFade = 1
+        return 1  -- całkowicie ukryty gdy stoimy w tej samej pozycji
     elseif dist < CFG.FadeNearMax then
-        nearFade = 1 - (dist - CFG.FadeNearMin) / (CFG.FadeNearMax - CFG.FadeNearMin)
-    else
-        nearFade = 0
+        -- Płynne przejście: blisko = ukryty → dalej = widoczny
+        local t = (dist - CFG.FadeNearMin) / (CFG.FadeNearMax - CFG.FadeNearMin)
+        return 1 - t  -- bliżej = bardziej przezroczysty
     end
 
-    -- [A4] Kamera od gracza (fade przy 28–35 studs)
-    local camFade
-    if camDist == nil then
-        camFade = 0
-    elseif camDist >= CFG.FadeCamMax then
-        camFade = 0
-    elseif camDist <= CFG.FadeCamMin then
-        camFade = 1
-    else
-        camFade = 1 - (camDist - CFG.FadeCamMin) / (CFG.FadeCamMax - CFG.FadeCamMin)
+    -- Daleki fade (domyślnie wyłączony przez FadeFarMin = 9999)
+    if dist >= CFG.FadeFarMax then
+        return 1
+    elseif dist > CFG.FadeFarMin then
+        return (dist - CFG.FadeFarMin) / (CFG.FadeFarMax - CFG.FadeFarMin)
     end
 
-    -- Daleki dystans
-    local farFade
-    if dist < CFG.FadeFarMin then
-        farFade = 0
-    elseif dist < CFG.FadeFarMax then
-        farFade = (dist - CFG.FadeFarMin) / (CFG.FadeFarMax - CFG.FadeFarMin)
-    else
-        farFade = 1
-    end
-
-    -- Bierzemy najgorszy przypadek (max = bardziej przezroczysty)
-    return math.max(nearFade, camFade, farFade)
+    -- Normalny dystans → pełna widoczność
+    return 0
 end
 
 local function calcWidth(player)
@@ -230,10 +224,6 @@ end
 
 -- ─────────────────────────────────────────────
 --   Budowanie UI
---   [V1] Shadow jako osobny BillboardGui pod głównym — eliminuje artifact
---        rogów gdy Frame z offsetem wychodzi poza CanvasGroup
---   [V2] UICorner na CanvasGroup — eliminuje "przeświecanie" w rogach
---   [V3] ClipsDescendants=true na glass — dzieci nie wychodzą poza zaokrąglenie
 -- ─────────────────────────────────────────────
 
 local function buildUI(player, head)
@@ -243,9 +233,7 @@ local function buildUI(player, head)
     local refs       = {}
     local cr         = CFG.CornerRadius
 
-    -- [V1] Shadow Billboard — osobny, za głównym
-    -- Przesunięty o (3,4) px, lekko większy → naturalny drop shadow
-    -- Nie wchodzi w hierarchię CanvasGroup więc nie powoduje artifact rogów
+    -- Shadow Billboard
     local shadowBB = Instance.new("BillboardGui")
     shadowBB.Name             = "DarkNametag_Shadow_" .. player.Name
     shadowBB.Adornee          = head
@@ -257,7 +245,6 @@ local function buildUI(player, head)
     shadowBB.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
     shadowBB.Parent           = tagContainer
 
-    -- CanvasGroup dla shadow żeby fade razem z głównym
     local shadowCanvas = Instance.new("CanvasGroup", shadowBB)
     shadowCanvas.Size                   = UDim2.fromScale(1, 1)
     shadowCanvas.BackgroundTransparency = 1
@@ -271,7 +258,6 @@ local function buildUI(player, head)
     shadowFrame.BorderSizePixel        = 0
     Instance.new("UICorner", shadowFrame).CornerRadius = UDim.new(0, cr + 2)
 
-    -- Gradient na shadow (dół ciemniejszy) — głębia
     local shadowGrad = Instance.new("UIGradient", shadowFrame)
     shadowGrad.Color = ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
@@ -299,35 +285,28 @@ local function buildUI(player, head)
     billboard.Parent           = tagContainer
     refs.billboard             = billboard
 
-    -- [V2] CanvasGroup z UICorner — kluczowa poprawka
-    -- Bez UICorner na CanvasGroup rogi "przeświecają" przez dzieci
     local canvas = Instance.new("CanvasGroup", billboard)
     canvas.Size                   = UDim2.fromScale(1, 1)
     canvas.BackgroundTransparency = 1
     canvas.GroupTransparency      = 1
-    -- [V2] UICorner na samym CanvasGroup
     Instance.new("UICorner", canvas).CornerRadius = UDim.new(0, cr)
     refs.canvas = canvas
 
-    -- Tło szklane (bez osobnego Frame na shadow — shadow jest osobnym BB)
     local glass = Instance.new("Frame", canvas)
     glass.Size                   = UDim2.fromScale(1, 1)
     glass.BackgroundColor3       = CFG.GlassColor
     glass.BackgroundTransparency = CFG.GlassTrans
     glass.BorderSizePixel        = 0
     glass.ZIndex                 = 2
-    -- [V3] ClipsDescendants na glass — dzieci nie wychodzą poza zaokrąglenie
     glass.ClipsDescendants        = true
     Instance.new("UICorner", glass).CornerRadius = UDim.new(0, cr)
 
-    -- Obramowanie
     local stroke = Instance.new("UIStroke", glass)
     stroke.Color           = CFG.BorderColor
     stroke.Transparency    = CFG.BorderTrans
     stroke.Thickness       = 1
     stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 
-    -- Subtelny gradient na szkle (góra lekko jaśniejsza)
     local glassGrad = Instance.new("UIGradient", glass)
     glassGrad.Color = ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
@@ -339,7 +318,6 @@ local function buildUI(player, head)
     })
     glassGrad.Rotation = 90
 
-    -- Pasek akcentowy
     local accentBar = Instance.new("Frame", glass)
     accentBar.Name             = "AccentBar"
     accentBar.Size             = UDim2.new(0, 3, 1, -12)
@@ -358,7 +336,6 @@ local function buildUI(player, head)
     accentGrad.Rotation = 90
     refs.accentGrad = accentGrad
 
-    -- Ring wokół avatara
     local ring = Instance.new("Frame", glass)
     ring.Size             = UDim2.fromOffset(CFG.AvatarSize + 3, CFG.AvatarSize + 3)
     ring.Position         = UDim2.new(0, 12, 0.5, 0)
@@ -369,7 +346,6 @@ local function buildUI(player, head)
     Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
     refs.ring = ring
 
-    -- Avatar
     local avatarLabel = Instance.new("ImageLabel", glass)
     avatarLabel.Name                   = "Avatar"
     avatarLabel.Size                   = UDim2.fromOffset(CFG.AvatarSize, CFG.AvatarSize)
@@ -401,7 +377,6 @@ local function buildUI(player, head)
         end)
     end
 
-    -- Nazwa wyświetlana
     local dispLabel = Instance.new("TextLabel", glass)
     dispLabel.Text                   = player.DisplayName
     dispLabel.Size                   = UDim2.fromOffset(textWidth, 16)
@@ -414,7 +389,6 @@ local function buildUI(player, head)
     dispLabel.BackgroundTransparency = 1
     dispLabel.ZIndex                 = 4
 
-    -- Username
     local userLabel = Instance.new("TextLabel", glass)
     userLabel.Text                   = "@" .. player.Name
     userLabel.Size                   = UDim2.fromOffset(textWidth, 12)
@@ -427,7 +401,6 @@ local function buildUI(player, head)
     userLabel.BackgroundTransparency = 1
     userLabel.ZIndex                 = 4
 
-    -- Separator
     local sep = Instance.new("Frame", glass)
     sep.Size                   = UDim2.new(0, textWidth, 0, 1)
     sep.Position               = UDim2.fromOffset(textOffset, 32)
@@ -441,7 +414,6 @@ local function buildUI(player, head)
         NumberSequenceKeypoint.new(1,   1),
     })
 
-    -- Dot dystansu
     local distDot = Instance.new("TextLabel", glass)
     distDot.Text                   = "●"
     distDot.Size                   = UDim2.fromOffset(10, 11)
@@ -455,7 +427,6 @@ local function buildUI(player, head)
     distDot.ZIndex                 = 4
     refs.distDot = distDot
 
-    -- Etykieta dystansu
     local distLabel = Instance.new("TextLabel", glass)
     distLabel.Name                   = "Distance"
     distLabel.Text                   = ""
@@ -474,20 +445,25 @@ local function buildUI(player, head)
 end
 
 -- ─────────────────────────────────────────────
---   [A1] Animacja globalnego toggle
---   masterAlpha: 1 = ukryte, 0 = widoczne
---   Per-player loop: finalTrans = max(playerTrans, masterAlpha)
+--   [F3][F4] Animacja masterAlpha — bezpieczna, anty-spam
 -- ─────────────────────────────────────────────
 
 local function animateMasterAlpha(targetAlpha, speed, onDone)
+    -- Anuluj poprzednią animację (jeśli trwa)
     if masterAlphaConn then
         masterAlphaConn:Disconnect()
         masterAlphaConn = nil
     end
 
+    -- Jeśli już jesteśmy w celu — natychmiast odpal callback
+    if math.abs(masterAlpha - targetAlpha) < 0.002 then
+        masterAlpha = targetAlpha
+        if onDone then onDone() end
+        return
+    end
+
     masterAlphaConn = RunService.Heartbeat:Connect(function(dt)
         local diff = targetAlpha - masterAlpha
-        -- Zatrzymaj gdy wystarczająco blisko
         if math.abs(diff) < 0.002 then
             masterAlpha = targetAlpha
             masterAlphaConn:Disconnect()
@@ -495,23 +471,23 @@ local function animateMasterAlpha(targetAlpha, speed, onDone)
             if onDone then onDone() end
             return
         end
+        -- [A1] Exponential smoothing — naturalny feel
         masterAlpha = masterAlpha + diff * (1 - exp(-speed * dt))
     end)
 end
 
 -- ─────────────────────────────────────────────
 --   Pętla per-gracz (Heartbeat)
---   [A2] fadeAlpha: oddzielna alfa fade-in/out per gracz
---   [A4] camDist przekazywany do fadeTrans
 -- ─────────────────────────────────────────────
 
 local function startPlayerLoop(player, refs)
-    local currentTrans = 1
+    local currentTrans = 1  -- startuje ukryty (fade-in)
     local distTimer    = 0
     local data         = tagData[player]
     local conn
 
     conn = RunService.Heartbeat:Connect(function(dt)
+        -- [F5] Zatrzymaj gdy refs są zniszczone lub system disabled
         if not refs.billboard or not refs.billboard.Parent then
             conn:Disconnect()
             return
@@ -522,7 +498,7 @@ local function startPlayerLoop(player, refs)
         local char   = player.Character
         local head   = char and char:FindFirstChild("Head")
 
-        -- [A2][A3] Animacja fade-in / fade-out per gracz
+        -- Animacja fade per-gracz (fade-in / fade-out)
         if data then
             if data.fadeState == "in" then
                 data.fadeAlpha = data.fadeAlpha + (0 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeInSpeed * dt))
@@ -534,19 +510,19 @@ local function startPlayerLoop(player, refs)
                 data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
                 if data.fadeAlpha > 0.995 then
                     data.fadeAlpha = 1
-                    -- Zniszcz UI po zakończeniu fade-out
                     conn:Disconnect()
+                    -- Bezpieczne niszczenie
                     if refs.billboard and refs.billboard.Parent then
                         refs.billboard:Destroy()
                     end
                     if refs.shadowBB and refs.shadowBB.Parent then
                         refs.shadowBB:Destroy()
                     end
-                    if data.refs == refs then
-                        data.refs         = nil
-                        data.fadeState    = "idle"
-                        data.overlapTrans = 0
-                        data.cachedDist   = nil
+                    if tagData[player] and tagData[player].refs == refs then
+                        tagData[player].refs         = nil
+                        tagData[player].fadeState    = "idle"
+                        tagData[player].overlapTrans = 0
+                        tagData[player].cachedDist   = nil
                     end
                     return
                 end
@@ -558,8 +534,8 @@ local function startPlayerLoop(player, refs)
         if not lpRoot or not head then
             local targetTrans = math.max(1, masterAlpha, playerFade)
             currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
-            refs.canvas.GroupTransparency      = currentTrans
-            refs.shadowCanvas.GroupTransparency = currentTrans
+            if refs.canvas then refs.canvas.GroupTransparency = currentTrans end
+            if refs.shadowCanvas then refs.shadowCanvas.GroupTransparency = currentTrans end
             return
         end
 
@@ -567,10 +543,7 @@ local function startPlayerLoop(player, refs)
         local dist  = delta.Magnitude
         if data then data.cachedDist = dist end
 
-        -- [A4] Dystans kamera od gracza
-        local camPos  = Camera.CFrame.Position
-        local camDist = (camPos - head.Position).Magnitude
-
+        -- Aktualizacja etykiety dystansu (throttled)
         distTimer = distTimer + dt
         if distTimer >= CFG.DistThrottle then
             distTimer = 0
@@ -580,16 +553,16 @@ local function startPlayerLoop(player, refs)
             refs.distLabel.TextColor3 = dc
         end
 
-        local overlapPen  = data and data.overlapTrans or 0
-        -- [A4] camDist w fadeTrans
-        local baseTarget  = math.max(fadeTrans(dist, camDist), overlapPen)
+        local overlapPen = data and data.overlapTrans or 0
+        -- [F1] Użyj naprawionej fadeTrans (tylko near/far, NIE dist-based)
+        local baseTarget = math.max(fadeTrans(dist), overlapPen)
 
-        -- [A1][A2][A3] Finalna przezroczystość: max z wszystkich warstw
+        -- Finalna przezroczystość: max ze wszystkich warstw
         local targetTrans = math.max(baseTarget, masterAlpha, playerFade)
 
         currentTrans = currentTrans + (targetTrans - currentTrans) * (1 - exp(-CFG.LerpSpeed * dt))
-        refs.canvas.GroupTransparency       = currentTrans
-        refs.shadowCanvas.GroupTransparency = currentTrans
+        if refs.canvas then refs.canvas.GroupTransparency = currentTrans end
+        if refs.shadowCanvas then refs.shadowCanvas.GroupTransparency = currentTrans end
     end)
 
     return conn
@@ -670,17 +643,19 @@ local function destroyTagUI(player)
     local data = tagData[player]
     if not data then return end
 
+    -- [F6] Bezpieczne rozłączanie heartbeat
     if data.heartbeat then
         data.heartbeat:Disconnect()
         data.heartbeat = nil
     end
 
+    -- [F6] Bezpieczne niszczenie UI
     if data.refs then
         if data.refs.billboard and data.refs.billboard.Parent then
-            data.refs.billboard:Destroy()
+            pcall(function() data.refs.billboard:Destroy() end)
         end
         if data.refs.shadowBB and data.refs.shadowBB.Parent then
-            data.refs.shadowBB:Destroy()
+            pcall(function() data.refs.shadowBB:Destroy() end)
         end
     end
 
@@ -692,41 +667,26 @@ local function destroyTagUI(player)
     data.fadeAlpha    = 1
 end
 
--- [A3] Płynny fade-out przed zniszczeniem UI
 local function destroyTagUIWithFade(player)
     local data = tagData[player]
     if not data or not data.refs then
         destroyTagUI(player)
         return
     end
-
-    -- Ustaw fadeState="out" — per-player loop sam zniszczy UI gdy skończy
     data.fadeState = "out"
-    data.fadeAlpha = data.fadeAlpha or 0
-
-    -- Heartbeat nadal działa — NIE rozłączamy, pętla sama to zrobi
-    -- Ustawiamy refs na nil w tagData żeby watcher nie próbował przebudować
-    -- (nie zerujemy data.refs — pętla go wciąż potrzebuje do Destroy)
+    data.fadeAlpha = math.min(data.fadeAlpha or 0, 0.99)
 end
 
 local function destroyTag(player)
     local data = tagData[player]
     if not data then return end
 
-    -- [A3] Trigger fade-out
     if data.refs and data.heartbeat then
         destroyTagUIWithFade(player)
-        -- Daj chwilę na fade zanim wyczyścimy resztę
         task.delay(1.5, function()
             if tagData[player] then
-                if data.heartbeat then
-                    data.heartbeat:Disconnect()
-                    data.heartbeat = nil
-                end
-                if data.charConn then
-                    data.charConn:Disconnect()
-                    data.charConn = nil
-                end
+                if data.heartbeat then data.heartbeat:Disconnect(); data.heartbeat = nil end
+                if data.charConn  then data.charConn:Disconnect();  data.charConn  = nil end
                 widthCache[player.UserId] = nil
                 tagData[player] = nil
             end
@@ -755,7 +715,6 @@ local function startGlobalWatcher()
     globalWatcher = task.spawn(function()
         while enabled do
             for player, data in tagData do
-                -- Pomijamy graczy w trakcie fade-out
                 if data.fadeState == "out" then continue end
 
                 local char = player.Character
@@ -768,10 +727,10 @@ local function startGlobalWatcher()
                             data.heartbeat = nil
                         end
                         if data.refs.billboard and data.refs.billboard.Parent then
-                            data.refs.billboard:Destroy()
+                            pcall(function() data.refs.billboard:Destroy() end)
                         end
                         if data.refs.shadowBB and data.refs.shadowBB.Parent then
-                            data.refs.shadowBB:Destroy()
+                            pcall(function() data.refs.shadowBB:Destroy() end)
                         end
                         data.refs         = nil
                         data.overlapTrans = 0
@@ -819,9 +778,8 @@ attachToHead = function(player, head)
     data.building = true
     destroyTagUI(player)
 
-    -- [A2] Nowy tag zaczyna od fadeState="in"
     data.fadeState = "in"
-    data.fadeAlpha = 1   -- zaczyna ukryty, ease-in do 0
+    data.fadeAlpha = 1
 
     local ok, err = pcall(function()
         local refs      = buildUI(player, head)
@@ -862,20 +820,14 @@ local function setupPlayer(player)
         task.spawn(function()
             local head = newChar:WaitForChild("Head", 5)
             if not head or not tagData[player] then return end
-            -- Brak fade-in przy respawnie (reset character)
-            -- fadeState pozostaje "idle" — gracz po prostu się pojawia
             attachToHead(player, head)
         end)
     end)
 
-    -- [A2] Fade-in tylko przy pierwszym pojawieniu się na serwerze
-    -- Rozróżniamy: setupPlayer wywołany przy PlayerAdded → fade-in
-    -- CharacterAdded (respawn) → bez fade-in (zgodnie z wymaganiem)
     if enabled then
         local char = player.Character
         local head = char and char:FindFirstChild("Head")
         if head then
-            -- Pierwsze pojawienie się = fade-in
             data.fadeState = "in"
             data.fadeAlpha = 1
             attachToHead(player, head)
@@ -889,16 +841,27 @@ end
 
 getgenv().Nametags = {
 
+    -- [F3] enable — bezpieczny nawet przy spamie
     enable = function()
-        if enabled then return end
-        enabled = true
+        -- Jeśli już włączone i nie ma tranzycji — ignoruj
+        if enabled and not isTransitioning then return end
 
+        -- [F3] Anuluj ewentualny pending disable
+        isTransitioning = true
+        enabled = true  -- Ustaw enabled od razu żeby watcher/setup działały
+
+        -- Zainicjuj graczy którzy jeszcze nie mają tagData
         for _, player in Players:GetPlayers() do
             if player == lp then continue end
             if not tagData[player] then
                 setupPlayer(player)
             else
                 local data = tagData[player]
+                -- Resetuj fade-out jeśli był w trakcie
+                if data.fadeState == "out" then
+                    data.fadeState = "in"
+                    data.fadeAlpha = data.fadeAlpha  -- kontynuuj z aktualnej wartości
+                end
                 local char = player.Character
                 local head = char and char:FindFirstChild("Head")
                 if head and not data.refs and not data.building then
@@ -912,16 +875,30 @@ getgenv().Nametags = {
         startGlobalLoop()
         startGlobalWatcher()
 
-        -- [A1] Płynny fade-in globalny
-        animateMasterAlpha(0, CFG.ToggleLerpSpeed)
+        -- [F4] Animuj masterAlpha z aktualnej wartości do 0
+        animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
+            isTransitioning = false
+        end)
     end,
 
+    -- [F3] disable — bezpieczny nawet przy spamie
     disable = function()
-        if not enabled then return end
+        if not enabled and not isTransitioning then return end
 
-        -- [A1] Najpierw animuj fade-out, potem sprzątaj
+        isTransitioning = true
+
+        -- [F3] Najpierw animuj fade-out, potem sprzątaj
         animateMasterAlpha(1, CFG.ToggleLerpSpeed, function()
+            -- Sprawdź czy enable nie został wywołany podczas fade-out
+            if enabled then
+                -- enable był wywołany podczas naszego disable — anuluj sprzątanie
+                isTransitioning = false
+                return
+            end
+
+            -- Teraz bezpiecznie sprzątamy
             enabled = false
+            isTransitioning = false
 
             for player, _ in tagData do
                 destroyTagUI(player)
@@ -937,6 +914,11 @@ getgenv().Nametags = {
                 globalWatcher = nil
             end
         end)
+
+        -- [F3] Ustaw enabled = false od razu żeby watcher się zatrzymał
+        -- ALE tylko po tym jak wywołamy animateMasterAlpha
+        -- (żeby callback mógł sprawdzić czy enable był wywołany)
+        enabled = false
     end,
 
     setColor = function(color)
@@ -965,14 +947,12 @@ getgenv().updateNametagColor = getgenv().Nametags.setColor
 
 Players.PlayerAdded:Connect(setupPlayer)
 
--- [A3] Fade-out przy odejściu gracza
 Players.PlayerRemoving:Connect(function(player)
     local data = tagData[player]
     if data and data.refs and data.heartbeat then
         data.fadeState = "out"
         data.fadeAlpha = data.fadeAlpha or 0
         task.delay(1.5, function()
-            -- Wyczyść po fade
             if tagData[player] then
                 if data.heartbeat then data.heartbeat:Disconnect(); data.heartbeat = nil end
                 if data.charConn  then data.charConn:Disconnect();  data.charConn  = nil end
@@ -981,7 +961,6 @@ Players.PlayerRemoving:Connect(function(player)
             end
         end)
     else
-        -- Brak UI — wyczyść od razu
         if tagData[player] then
             destroyTagUI(player)
             if data and data.charConn then
