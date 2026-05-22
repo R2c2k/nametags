@@ -1,424 +1,303 @@
--- =============================================
---       NAMETAG SYSTEM v19.1 - Dark Theme
---       Fixes v19.1:
---         - HD Admin ;char / ;spongify / ;freakify etc.
---           CharacterAdded nie odpala → watchdog w HB
---         - AdorneeParent=nil (stara głowa odłączona)
---           → re-attach do nowej głowy w HB
---         - Nowi gracze bez billboardu
---           → backup CharacterAdded przez player.ChildAdded
--- =============================================
-
+-- NAMETAG SYSTEM v19.1
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
 local TextService = game:GetService("TextService")
 local CoreGui     = game:GetService("CoreGui")
-
 local lp = Players.LocalPlayer
 
--- ─────────────────────────────────────────────
---   Konfiguracja
--- ─────────────────────────────────────────────
-
 local CFG = {
-    Height      = 46,
-    AvatarSize  = 28,
-    WidthMin    = 100,
-    WidthMax    = 500,
-    WidthPadR   = 10,
-    StudsOffset = Vector3.new(0, 2.4, 0),
-    CornerRadius = 10,
-
-    TextOffsetY_Name = 6,
-    TextOffsetY_User = 21,
-    TextOffsetY_Sep  = 32,
-    TextOffsetY_Dist = 34,
-
-    AlwaysOnTop = true,
-
-    LerpSpeed          = 10,
-    ToggleLerpSpeed    = 8,
-    PlayerFadeInSpeed  = 6,
-    PlayerFadeOutSpeed = 7,
-
-    GlassColor  = Color3.fromRGB(25, 25, 25),
-    GlassTrans  = 0.12,
-    BorderColor = Color3.fromRGB(60, 60, 60),
-    BorderTrans = 0.40,
-    ShadowColor = Color3.fromRGB(0, 0, 0),
-    ShadowTrans = 0.55,
-
-    Accent = Color3.fromRGB(0, 160, 255),
-
-    TextMain = Color3.fromRGB(240, 240, 240),
-    TextSub  = Color3.fromRGB(178, 178, 178),
-    TextMeta = Color3.fromRGB(140, 140, 140),
-    SepColor = Color3.fromRGB(50, 50, 65),
-
-    DistClose  = 20,
-    DistFar    = 60,
-    ColorClose = Color3.fromRGB(80, 220, 120),
-    ColorMid   = Color3.fromRGB(255, 200, 60),
-    ColorFar   = Color3.fromRGB(255, 80, 80),
-
-    FontMain = Enum.Font.GothamBold,
-    FontSub  = Enum.Font.Gotham,
-    FontMeta = Enum.Font.Gotham,
-
-    DistThrottle = 0.16,
+    Height=46, AvatarSize=28, WidthMin=100, WidthMax=500, WidthPadR=10,
+    StudsOffset=Vector3.new(0,2.4,0), CornerRadius=10,
+    TextOffsetY_Name=6, TextOffsetY_User=21, TextOffsetY_Sep=32, TextOffsetY_Dist=34,
+    AlwaysOnTop=true,
+    LerpSpeed=10, ToggleLerpSpeed=8, PlayerFadeInSpeed=6, PlayerFadeOutSpeed=7,
+    GlassColor=Color3.fromRGB(25,25,25), GlassTrans=0.12,
+    BorderColor=Color3.fromRGB(60,60,60), BorderTrans=0.40,
+    ShadowColor=Color3.fromRGB(0,0,0), ShadowTrans=0.55,
+    Accent=Color3.fromRGB(0,160,255),
+    TextMain=Color3.fromRGB(240,240,240), TextSub=Color3.fromRGB(178,178,178),
+    TextMeta=Color3.fromRGB(140,140,140), SepColor=Color3.fromRGB(50,50,65),
+    DistClose=20, DistFar=60,
+    ColorClose=Color3.fromRGB(80,220,120), ColorMid=Color3.fromRGB(255,200,60),
+    ColorFar=Color3.fromRGB(255,80,80),
+    FontMain=Enum.Font.GothamBold, FontSub=Enum.Font.Gotham, FontMeta=Enum.Font.Gotham,
+    DistThrottle=0.16,
 }
 
--- ─────────────────────────────────────────────
---   Stan globalny
--- ─────────────────────────────────────────────
-
-local enabled         = false
-local isTransitioning = false
-local accentColor     = CFG.Accent
-local masterAlpha     = 1
-local masterAlphaConn = nil
-local globalHeartbeat = nil
-local avatarCache     = {}
-local widthCache      = {}
-local tagData         = {}
-
--- ─────────────────────────────────────────────
---   Kontener GUI
--- ─────────────────────────────────────────────
+local enabled=false, isTransitioning=false
+local accentColor=CFG.Accent
+local masterAlpha=1, masterAlphaConn=nil, globalHeartbeat=nil
+local avatarCache={}, widthCache={}, tagData={}
 
 local tagContainer = CoreGui:FindFirstChild("NametagContainer_v19")
 if not tagContainer then
-    tagContainer      = Instance.new("Folder")
+    tagContainer = Instance.new("Folder")
     tagContainer.Name = "NametagContainer_v19"
     tagContainer.Parent = CoreGui
 end
 
--- ─────────────────────────────────────────────
---   Utility
--- ─────────────────────────────────────────────
+local exp=math.exp, abs=math.abs, clamp=math.clamp
+local floor=math.floor, max=math.max, format=string.format
 
-local exp    = math.exp
-local abs    = math.abs
-local clamp  = math.clamp
-local floor  = math.floor
-local max    = math.max
-local format = string.format
-
-local function lerpColor(c1, c2, t)
-    return Color3.new(
-        c1.R + (c2.R - c1.R) * t,
-        c1.G + (c2.G - c1.G) * t,
-        c1.B + (c2.B - c1.B) * t
-    )
+local function lerpColor(c1,c2,t)
+    return Color3.new(c1.R+(c2.R-c1.R)*t, c1.G+(c2.G-c1.G)*t, c1.B+(c2.B-c1.B)*t)
 end
 
 local function distColor(d)
-    local close = CFG.DistClose
-    local far   = CFG.DistFar
-    local mid   = (close + far) * 0.5
-    if d <= close then
-        return CFG.ColorClose
-    elseif d <= mid then
-        return lerpColor(CFG.ColorClose, CFG.ColorMid, (d - close) / (mid - close))
-    elseif d <= far then
-        return lerpColor(CFG.ColorMid, CFG.ColorFar, (d - mid) / (far - mid))
-    else
-        return CFG.ColorFar
-    end
+    local close,far=CFG.DistClose,CFG.DistFar
+    local mid=(close+far)*0.5
+    if d<=close then return CFG.ColorClose
+    elseif d<=mid then return lerpColor(CFG.ColorClose,CFG.ColorMid,(d-close)/(mid-close))
+    elseif d<=far then return lerpColor(CFG.ColorMid,CFG.ColorFar,(d-mid)/(far-mid))
+    else return CFG.ColorFar end
 end
 
 local function accentGradientColor(color)
     return ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(
-            math.min(color.R * 1.35, 1),
-            math.min(color.G * 1.35, 1),
-            math.min(color.B * 1.35, 1)
-        )),
-        ColorSequenceKeypoint.new(1, Color3.new(
-            color.R * 0.55,
-            color.G * 0.55,
-            color.B * 0.55
-        )),
+        ColorSequenceKeypoint.new(0,Color3.new(math.min(color.R*1.35,1),math.min(color.G*1.35,1),math.min(color.B*1.35,1))),
+        ColorSequenceKeypoint.new(1,Color3.new(color.R*0.55,color.G*0.55,color.B*0.55)),
     })
 end
 
 local function calcWidth(player)
-    local userId = player.UserId
-    if widthCache[userId] then return widthCache[userId] end
-    local dispName     = player.DisplayName
-    local userName     = player.Name
-    local avatarOffset = CFG.AvatarSize + 18
-    local bigBounds    = Vector2.new(9999, 16)
-    local subBounds    = Vector2.new(9999, 13)
-    local w = math.max(
-        TextService:GetTextSize(dispName,        11, CFG.FontMain, bigBounds).X,
-        TextService:GetTextSize("@" .. userName,  9, CFG.FontSub,  subBounds).X,
-        TextService:GetTextSize("999 studs",      8, CFG.FontMeta, subBounds).X
+    local uid=player.UserId
+    if widthCache[uid] then return widthCache[uid] end
+    local dn=player.DisplayName, un=player.Name
+    local ao=CFG.AvatarSize+18
+    local bb=Vector2.new(9999,16), sb=Vector2.new(9999,13)
+    local w=math.max(
+        TextService:GetTextSize(dn,11,CFG.FontMain,bb).X,
+        TextService:GetTextSize("@"..un,9,CFG.FontSub,sb).X,
+        TextService:GetTextSize("999 studs",8,CFG.FontMeta,sb).X
     )
-    local result = clamp(avatarOffset + w + CFG.WidthPadR, CFG.WidthMin, CFG.WidthMax)
-    widthCache[userId] = result
-    return result
+    local r=clamp(ao+w+CFG.WidthPadR,CFG.WidthMin,CFG.WidthMax)
+    widthCache[uid]=r
+    return r
 end
 
--- ─────────────────────────────────────────────
---   Budowanie UI
--- ─────────────────────────────────────────────
+local function findHead(player)
+    local char=player.Character
+    if not char then return nil end
+    local h=char:FindFirstChild("Head")
+    if h then return h end
+    for _,v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name=="Head" then return v end
+    end
+    return nil
+end
 
-local function buildUI(player, head)
-    local totalWidth = calcWidth(player)
-    local textOffset = CFG.AvatarSize + 18
-    local textWidth  = totalWidth - textOffset - CFG.WidthPadR
-    local refs       = {}
-    local cr         = CFG.CornerRadius
-    local tY_Name = CFG.TextOffsetY_Name
-    local tY_User = CFG.TextOffsetY_User
-    local tY_Sep  = CFG.TextOffsetY_Sep
-    local tY_Dist = CFG.TextOffsetY_Dist
+local function buildUI(player,head)
+    local totalWidth=calcWidth(player)
+    local textOffset=CFG.AvatarSize+18
+    local textWidth=totalWidth-textOffset-CFG.WidthPadR
+    local refs={}, cr=CFG.CornerRadius
+    local tYN=CFG.TextOffsetY_Name, tYU=CFG.TextOffsetY_User
+    local tYS=CFG.TextOffsetY_Sep,  tYD=CFG.TextOffsetY_Dist
 
-    local shadowBB = Instance.new("BillboardGui")
-    shadowBB.Name             = "DNT_Shadow_" .. player.Name
-    shadowBB.Adornee          = head
-    shadowBB.Size             = UDim2.fromOffset(totalWidth + 4, CFG.Height + 4)
-    shadowBB.StudsOffset      = CFG.StudsOffset + Vector3.new(0, -0.04, -0.01)
-    shadowBB.AlwaysOnTop      = CFG.AlwaysOnTop
-    shadowBB.ResetOnSpawn     = false
-    shadowBB.ClipsDescendants = false
-    shadowBB.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
-    shadowBB.Parent           = tagContainer
+    local shadowBB=Instance.new("BillboardGui")
+    shadowBB.Name="DNT_Shadow_"..player.Name
+    shadowBB.Adornee=head
+    shadowBB.Size=UDim2.fromOffset(totalWidth+4,CFG.Height+4)
+    shadowBB.StudsOffset=CFG.StudsOffset+Vector3.new(0,-0.04,-0.01)
+    shadowBB.AlwaysOnTop=CFG.AlwaysOnTop
+    shadowBB.ResetOnSpawn=false
+    shadowBB.ClipsDescendants=false
+    shadowBB.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    shadowBB.Parent=tagContainer
 
-    local shadowCanvas = Instance.new("CanvasGroup", shadowBB)
-    shadowCanvas.Size                   = UDim2.fromScale(1, 1)
-    shadowCanvas.BackgroundTransparency = 1
-    shadowCanvas.GroupTransparency      = 1
+    local shadowCanvas=Instance.new("CanvasGroup",shadowBB)
+    shadowCanvas.Size=UDim2.fromScale(1,1)
+    shadowCanvas.BackgroundTransparency=1
+    shadowCanvas.GroupTransparency=1
 
-    local shadowFrame = Instance.new("Frame", shadowCanvas)
-    shadowFrame.Size                   = UDim2.fromScale(1, 1)
-    shadowFrame.BackgroundColor3       = CFG.ShadowColor
-    shadowFrame.BackgroundTransparency = CFG.ShadowTrans
-    shadowFrame.BorderSizePixel        = 0
-    Instance.new("UICorner", shadowFrame).CornerRadius = UDim.new(0, cr + 2)
+    local shadowFrame=Instance.new("Frame",shadowCanvas)
+    shadowFrame.Size=UDim2.fromScale(1,1)
+    shadowFrame.BackgroundColor3=CFG.ShadowColor
+    shadowFrame.BackgroundTransparency=CFG.ShadowTrans
+    shadowFrame.BorderSizePixel=0
+    Instance.new("UICorner",shadowFrame).CornerRadius=UDim.new(0,cr+2)
+    local sg=Instance.new("UIGradient",shadowFrame)
+    sg.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(0,0,0)),ColorSequenceKeypoint.new(1,Color3.new(0,0,0))})
+    sg.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,CFG.ShadowTrans-0.1),NumberSequenceKeypoint.new(1,CFG.ShadowTrans+0.2)})
+    sg.Rotation=90
+    refs.shadowBB=shadowBB
+    refs.shadowCanvas=shadowCanvas
 
-    local shadowGrad = Instance.new("UIGradient", shadowFrame)
-    shadowGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
-        ColorSequenceKeypoint.new(1, Color3.new(0, 0, 0)),
-    })
-    shadowGrad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, CFG.ShadowTrans - 0.1),
-        NumberSequenceKeypoint.new(1, CFG.ShadowTrans + 0.2),
-    })
-    shadowGrad.Rotation = 90
-    refs.shadowBB     = shadowBB
-    refs.shadowCanvas = shadowCanvas
+    local billboard=Instance.new("BillboardGui")
+    billboard.Name="DNT_"..player.Name
+    billboard.Adornee=head
+    billboard.Size=UDim2.fromOffset(totalWidth,CFG.Height)
+    billboard.StudsOffset=CFG.StudsOffset
+    billboard.AlwaysOnTop=CFG.AlwaysOnTop
+    billboard.ResetOnSpawn=false
+    billboard.ClipsDescendants=false
+    billboard.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    billboard.Parent=tagContainer
+    refs.billboard=billboard
 
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name             = "DNT_" .. player.Name
-    billboard.Adornee          = head
-    billboard.Size             = UDim2.fromOffset(totalWidth, CFG.Height)
-    billboard.StudsOffset      = CFG.StudsOffset
-    billboard.AlwaysOnTop      = CFG.AlwaysOnTop
-    billboard.ResetOnSpawn     = false
-    billboard.ClipsDescendants = false
-    billboard.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
-    billboard.Parent           = tagContainer
-    refs.billboard             = billboard
+    local canvas=Instance.new("CanvasGroup",billboard)
+    canvas.Size=UDim2.fromScale(1,1)
+    canvas.BackgroundTransparency=1
+    canvas.GroupTransparency=1
+    Instance.new("UICorner",canvas).CornerRadius=UDim.new(0,cr)
+    refs.canvas=canvas
 
-    local canvas = Instance.new("CanvasGroup", billboard)
-    canvas.Size                   = UDim2.fromScale(1, 1)
-    canvas.BackgroundTransparency = 1
-    canvas.GroupTransparency      = 1
-    Instance.new("UICorner", canvas).CornerRadius = UDim.new(0, cr)
-    refs.canvas = canvas
+    local glass=Instance.new("Frame",canvas)
+    glass.Size=UDim2.fromScale(1,1)
+    glass.BackgroundColor3=CFG.GlassColor
+    glass.BackgroundTransparency=CFG.GlassTrans
+    glass.BorderSizePixel=0
+    glass.ZIndex=2
+    glass.ClipsDescendants=true
+    Instance.new("UICorner",glass).CornerRadius=UDim.new(0,cr)
+    local gg=Instance.new("UIGradient",glass)
+    gg.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.85,0.85,0.85))})
+    gg.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,CFG.GlassTrans-0.04),NumberSequenceKeypoint.new(1,CFG.GlassTrans+0.08)})
+    gg.Rotation=90
+    local us=Instance.new("UIStroke",glass)
+    us.Color=CFG.BorderColor
+    us.Transparency=CFG.BorderTrans
+    us.Thickness=1
+    us.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
 
-    local glass = Instance.new("Frame", canvas)
-    glass.Size                   = UDim2.fromScale(1, 1)
-    glass.BackgroundColor3       = CFG.GlassColor
-    glass.BackgroundTransparency = CFG.GlassTrans
-    glass.BorderSizePixel        = 0
-    glass.ZIndex                 = 2
-    glass.ClipsDescendants       = true
-    Instance.new("UICorner", glass).CornerRadius = UDim.new(0, cr)
+    local accentBar=Instance.new("Frame",glass)
+    accentBar.Name="AccentBar"
+    accentBar.Size=UDim2.new(0,3,1,-12)
+    accentBar.Position=UDim2.fromOffset(5,6)
+    accentBar.BackgroundColor3=accentColor
+    accentBar.BorderSizePixel=0
+    accentBar.ZIndex=3
+    Instance.new("UICorner",accentBar).CornerRadius=UDim.new(0,3)
+    refs.accentBar=accentBar
+    local ag=Instance.new("UIGradient",accentBar)
+    ag.Color=accentGradientColor(accentColor)
+    ag.Rotation=90
+    refs.accentGrad=ag
 
-    local glassGrad = Instance.new("UIGradient", glass)
-    glassGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-        ColorSequenceKeypoint.new(1, Color3.new(0.85, 0.85, 0.85)),
-    })
-    glassGrad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, CFG.GlassTrans - 0.04),
-        NumberSequenceKeypoint.new(1, CFG.GlassTrans + 0.08),
-    })
-    glassGrad.Rotation = 90
+    local ring=Instance.new("Frame",glass)
+    ring.Size=UDim2.fromOffset(CFG.AvatarSize+3,CFG.AvatarSize+3)
+    ring.Position=UDim2.new(0,12,0.5,0)
+    ring.AnchorPoint=Vector2.new(0,0.5)
+    ring.BackgroundColor3=accentColor
+    ring.BorderSizePixel=0
+    ring.ZIndex=3
+    Instance.new("UICorner",ring).CornerRadius=UDim.new(1,0)
+    refs.ring=ring
 
-    local uiStroke = Instance.new("UIStroke", glass)
-    uiStroke.Color           = CFG.BorderColor
-    uiStroke.Transparency    = CFG.BorderTrans
-    uiStroke.Thickness       = 1
-    uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    local avatarLabel=Instance.new("ImageLabel",glass)
+    avatarLabel.Size=UDim2.fromOffset(CFG.AvatarSize,CFG.AvatarSize)
+    avatarLabel.Position=UDim2.new(0,13,0.5,0)
+    avatarLabel.AnchorPoint=Vector2.new(0,0.5)
+    avatarLabel.BackgroundColor3=Color3.fromRGB(30,30,38)
+    avatarLabel.BackgroundTransparency=0
+    avatarLabel.Image=""
+    avatarLabel.ZIndex=4
+    Instance.new("UICorner",avatarLabel).CornerRadius=UDim.new(1,0)
 
-    local accentBar = Instance.new("Frame", glass)
-    accentBar.Name             = "AccentBar"
-    accentBar.Size             = UDim2.new(0, 3, 1, -12)
-    accentBar.Position         = UDim2.fromOffset(5, 6)
-    accentBar.BackgroundColor3 = accentColor
-    accentBar.BorderSizePixel  = 0
-    accentBar.ZIndex           = 3
-    Instance.new("UICorner", accentBar).CornerRadius = UDim.new(0, 3)
-    refs.accentBar = accentBar
-
-    local accentGrad = Instance.new("UIGradient", accentBar)
-    accentGrad.Color    = accentGradientColor(accentColor)
-    accentGrad.Rotation = 90
-    refs.accentGrad = accentGrad
-
-    local ring = Instance.new("Frame", glass)
-    ring.Size             = UDim2.fromOffset(CFG.AvatarSize + 3, CFG.AvatarSize + 3)
-    ring.Position         = UDim2.new(0, 12, 0.5, 0)
-    ring.AnchorPoint      = Vector2.new(0, 0.5)
-    ring.BackgroundColor3 = accentColor
-    ring.BorderSizePixel  = 0
-    ring.ZIndex           = 3
-    Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
-    refs.ring = ring
-
-    local avatarLabel = Instance.new("ImageLabel", glass)
-    avatarLabel.Size                   = UDim2.fromOffset(CFG.AvatarSize, CFG.AvatarSize)
-    avatarLabel.Position               = UDim2.new(0, 13, 0.5, 0)
-    avatarLabel.AnchorPoint            = Vector2.new(0, 0.5)
-    avatarLabel.BackgroundColor3       = Color3.fromRGB(30, 30, 38)
-    avatarLabel.BackgroundTransparency = 0
-    avatarLabel.Image                  = ""
-    avatarLabel.ZIndex                 = 4
-    Instance.new("UICorner", avatarLabel).CornerRadius = UDim.new(1, 0)
-
-    local userId  = player.UserId
-    local tagSnap = tagData[player]
-
-    if avatarCache[userId] then
-        avatarLabel.Image                  = avatarCache[userId]
-        avatarLabel.BackgroundTransparency = 1
+    local uid=player.UserId
+    local tagSnap=tagData[player]
+    if avatarCache[uid] then
+        avatarLabel.Image=avatarCache[uid]
+        avatarLabel.BackgroundTransparency=1
     else
         task.spawn(function()
-            local ok, img = pcall(
-                Players.GetUserThumbnailAsync, Players,
-                userId,
-                Enum.ThumbnailType.HeadShot,
-                Enum.ThumbnailSize.Size48x48
-            )
-            if ok and img
-                and avatarLabel.Parent
-                and tagData[player] == tagSnap
-                and tagSnap.refs
-            then
-                avatarCache[userId]                = img
-                avatarLabel.Image                  = img
-                avatarLabel.BackgroundTransparency = 1
+            local ok,img=pcall(Players.GetUserThumbnailAsync,Players,uid,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48)
+            if ok and img and avatarLabel.Parent and tagData[player]==tagSnap and tagSnap.refs then
+                avatarCache[uid]=img
+                avatarLabel.Image=img
+                avatarLabel.BackgroundTransparency=1
             end
         end)
     end
 
-    local dispLabel = Instance.new("TextLabel", glass)
-    dispLabel.Text                   = player.DisplayName
-    dispLabel.Size                   = UDim2.fromOffset(textWidth, 16)
-    dispLabel.Position               = UDim2.fromOffset(textOffset, tY_Name)
-    dispLabel.Font                   = CFG.FontMain
-    dispLabel.TextColor3             = CFG.TextMain
-    dispLabel.TextSize               = 11
-    dispLabel.TextScaled             = false
-    dispLabel.TextXAlignment         = Enum.TextXAlignment.Left
-    dispLabel.BackgroundTransparency = 1
-    dispLabel.ZIndex                 = 4
+    local dispLabel=Instance.new("TextLabel",glass)
+    dispLabel.Text=player.DisplayName
+    dispLabel.Size=UDim2.fromOffset(textWidth,16)
+    dispLabel.Position=UDim2.fromOffset(textOffset,tYN)
+    dispLabel.Font=CFG.FontMain
+    dispLabel.TextColor3=CFG.TextMain
+    dispLabel.TextSize=11
+    dispLabel.TextScaled=false
+    dispLabel.TextXAlignment=Enum.TextXAlignment.Left
+    dispLabel.BackgroundTransparency=1
+    dispLabel.ZIndex=4
 
-    local userLabel = Instance.new("TextLabel", glass)
-    userLabel.Text                   = "@" .. player.Name
-    userLabel.Size                   = UDim2.fromOffset(textWidth, 12)
-    userLabel.Position               = UDim2.fromOffset(textOffset, tY_User)
-    userLabel.Font                   = CFG.FontSub
-    userLabel.TextColor3             = CFG.TextSub
-    userLabel.TextSize               = 9
-    userLabel.TextScaled             = false
-    userLabel.TextXAlignment         = Enum.TextXAlignment.Left
-    userLabel.BackgroundTransparency = 1
-    userLabel.ZIndex                 = 4
+    local userLabel=Instance.new("TextLabel",glass)
+    userLabel.Text="@"..player.Name
+    userLabel.Size=UDim2.fromOffset(textWidth,12)
+    userLabel.Position=UDim2.fromOffset(textOffset,tYU)
+    userLabel.Font=CFG.FontSub
+    userLabel.TextColor3=CFG.TextSub
+    userLabel.TextSize=9
+    userLabel.TextScaled=false
+    userLabel.TextXAlignment=Enum.TextXAlignment.Left
+    userLabel.BackgroundTransparency=1
+    userLabel.ZIndex=4
 
-    local sep = Instance.new("Frame", glass)
-    sep.Size                   = UDim2.new(0, textWidth, 0, 1)
-    sep.Position               = UDim2.fromOffset(textOffset, tY_Sep)
-    sep.BackgroundColor3       = CFG.SepColor
-    sep.BackgroundTransparency = 0
-    sep.BorderSizePixel        = 0
-    sep.ZIndex                 = 4
-    Instance.new("UIGradient", sep).Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0,   0),
-        NumberSequenceKeypoint.new(0.7, 0),
-        NumberSequenceKeypoint.new(1,   1),
-    })
+    local sep=Instance.new("Frame",glass)
+    sep.Size=UDim2.new(0,textWidth,0,1)
+    sep.Position=UDim2.fromOffset(textOffset,tYS)
+    sep.BackgroundColor3=CFG.SepColor
+    sep.BackgroundTransparency=0
+    sep.BorderSizePixel=0
+    sep.ZIndex=4
+    Instance.new("UIGradient",sep).Transparency=NumberSequence.new({
+        NumberSequenceKeypoint.new(0,0),NumberSequenceKeypoint.new(0.7,0),NumberSequenceKeypoint.new(1,1)})
 
-    local distDot = Instance.new("TextLabel", glass)
-    distDot.Text                   = "●"
-    distDot.Size                   = UDim2.fromOffset(10, 11)
-    distDot.Position               = UDim2.fromOffset(textOffset, tY_Dist)
-    distDot.Font                   = CFG.FontMeta
-    distDot.TextColor3             = CFG.ColorClose
-    distDot.TextSize               = 7
-    distDot.TextScaled             = false
-    distDot.TextXAlignment         = Enum.TextXAlignment.Left
-    distDot.BackgroundTransparency = 1
-    distDot.ZIndex                 = 4
-    refs.distDot = distDot
+    local distDot=Instance.new("TextLabel",glass)
+    distDot.Text="●"
+    distDot.Size=UDim2.fromOffset(10,11)
+    distDot.Position=UDim2.fromOffset(textOffset,tYD)
+    distDot.Font=CFG.FontMeta
+    distDot.TextColor3=CFG.ColorClose
+    distDot.TextSize=7
+    distDot.TextScaled=false
+    distDot.TextXAlignment=Enum.TextXAlignment.Left
+    distDot.BackgroundTransparency=1
+    distDot.ZIndex=4
+    refs.distDot=distDot
 
-    local distLabel = Instance.new("TextLabel", glass)
-    distLabel.Text                   = ""
-    distLabel.Size                   = UDim2.fromOffset(textWidth - 12, 11)
-    distLabel.Position               = UDim2.fromOffset(textOffset + 11, tY_Dist)
-    distLabel.Font                   = CFG.FontMeta
-    distLabel.TextColor3             = CFG.TextMeta
-    distLabel.TextSize               = 8
-    distLabel.TextScaled             = false
-    distLabel.TextXAlignment         = Enum.TextXAlignment.Left
-    distLabel.BackgroundTransparency = 1
-    distLabel.ZIndex                 = 4
-    refs.distLabel = distLabel
+    local distLabel=Instance.new("TextLabel",glass)
+    distLabel.Text=""
+    distLabel.Size=UDim2.fromOffset(textWidth-12,11)
+    distLabel.Position=UDim2.fromOffset(textOffset+11,tYD)
+    distLabel.Font=CFG.FontMeta
+    distLabel.TextColor3=CFG.TextMeta
+    distLabel.TextSize=8
+    distLabel.TextScaled=false
+    distLabel.TextXAlignment=Enum.TextXAlignment.Left
+    distLabel.BackgroundTransparency=1
+    distLabel.ZIndex=4
+    refs.distLabel=distLabel
 
     return refs
 end
 
--- ─────────────────────────────────────────────
---   Animacja masterAlpha
--- ─────────────────────────────────────────────
-
-local function animateMasterAlpha(targetAlpha, speed, onDone)
-    if masterAlphaConn then
-        masterAlphaConn:Disconnect()
-        masterAlphaConn = nil
-    end
-    if abs(masterAlpha - targetAlpha) < 0.002 then
-        masterAlpha = targetAlpha
+local function animateMasterAlpha(targetAlpha,speed,onDone)
+    if masterAlphaConn then masterAlphaConn:Disconnect() masterAlphaConn=nil end
+    if abs(masterAlpha-targetAlpha)<0.002 then
+        masterAlpha=targetAlpha
         if onDone then onDone() end
         return
     end
-    masterAlphaConn = RunService.Heartbeat:Connect(function(dt)
-        local diff = targetAlpha - masterAlpha
-        if abs(diff) < 0.002 then
-            masterAlpha = targetAlpha
+    masterAlphaConn=RunService.Heartbeat:Connect(function(dt)
+        local diff=targetAlpha-masterAlpha
+        if abs(diff)<0.002 then
+            masterAlpha=targetAlpha
             masterAlphaConn:Disconnect()
-            masterAlphaConn = nil
+            masterAlphaConn=nil
             if onDone then onDone() end
             return
         end
-        masterAlpha = masterAlpha + diff * (1 - exp(-speed * dt))
+        masterAlpha=masterAlpha+diff*(1-exp(-speed*dt))
     end)
 end
 
--- ─────────────────────────────────────────────
---   Niszczenie UI
--- ─────────────────────────────────────────────
-
-local function destroyTagUI(player, withFade)
-    local data = tagData[player]
+local function destroyTagUI(player,withFade)
+    local data=tagData[player]
     if not data then return end
     if withFade and data.refs then
-        data.fadeState = "out"
+        data.fadeState="out"
     else
         if data.refs then
             if data.refs.billboard and data.refs.billboard.Parent then
@@ -427,40 +306,31 @@ local function destroyTagUI(player, withFade)
             if data.refs.shadowBB and data.refs.shadowBB.Parent then
                 pcall(function() data.refs.shadowBB:Destroy() end)
             end
-            data.refs = nil
+            data.refs=nil
         end
-        data.fadeState    = "idle"
-        data.fadeAlpha    = 1
-        data.currentTrans = 1
-        data.building     = false
+        data.fadeState="idle"
+        data.fadeAlpha=1
+        data.currentTrans=1
+        data.building=false
     end
 end
 
--- ─────────────────────────────────────────────
---   Podpięcie taga pod głowę
--- ─────────────────────────────────────────────
-
-local function attachToHead(player, head, toggleBuild)
-    local data = tagData[player]
+local function attachToHead(player,head,toggleBuild)
+    local data=tagData[player]
     if not data or not enabled then return end
     if not head or not head.Parent then return end
     if data.building then return end
-    if data.fadeState == "out" then return end
+    if data.fadeState=="out" then return end
 
-    -- Jeśli billboard już istnieje i HEAD jest ten sam — tylko upewnij się że adornee ok
     if data.refs and data.refs.billboard and data.refs.billboard.Parent then
-        if data.refs.billboard.Adornee ~= head then
-            -- FIX v19.1: re-attach do nowej głowy (;spongify, ;char itp.)
-            data.refs.billboard.Adornee = head
-            if data.refs.shadowBB then
-                data.refs.shadowBB.Adornee = head
-            end
+        if data.refs.billboard.Adornee~=head then
+            data.refs.billboard.Adornee=head
+            if data.refs.shadowBB then data.refs.shadowBB.Adornee=head end
         end
         return
     end
 
-    data.building = true
-
+    data.building=true
     if data.refs then
         if data.refs.billboard and data.refs.billboard.Parent then
             pcall(function() data.refs.billboard:Destroy() end)
@@ -468,290 +338,186 @@ local function attachToHead(player, head, toggleBuild)
         if data.refs.shadowBB and data.refs.shadowBB.Parent then
             pcall(function() data.refs.shadowBB:Destroy() end)
         end
-        data.refs = nil
+        data.refs=nil
     end
 
     if toggleBuild then
-        data.fadeState    = "idle"
-        data.fadeAlpha    = 0
-        data.currentTrans = masterAlpha
+        data.fadeState="idle" data.fadeAlpha=0 data.currentTrans=masterAlpha
     else
-        data.fadeState    = "in"
-        data.fadeAlpha    = 1
-        data.currentTrans = 1
+        data.fadeState="in" data.fadeAlpha=1 data.currentTrans=1
     end
+    local initTrans=data.currentTrans
 
-    local initTrans = data.currentTrans
-
-    local ok, err = pcall(function()
-        local refs = buildUI(player, head)
-        refs.canvas.GroupTransparency       = initTrans
-        refs.shadowCanvas.GroupTransparency = initTrans
-        data.refs = refs
+    local ok,err=pcall(function()
+        local refs=buildUI(player,head)
+        refs.canvas.GroupTransparency=initTrans
+        refs.shadowCanvas.GroupTransparency=initTrans
+        data.refs=refs
     end)
-
-    data.building = false
-
-    if not ok then
-        warn("[Nametags] attachToHead [" .. player.Name .. "]: " .. tostring(err))
-    end
+    data.building=false
+    if not ok then warn("[Nametags] attachToHead ["..player.Name.."]: "..tostring(err)) end
 end
 
--- ─────────────────────────────────────────────
---   FIX v19.1: Znajdź aktualną głowę gracza
---   Obsługuje przypadki gdy Character.Head
---   nie istnieje natychmiast (async load avatara)
--- ─────────────────────────────────────────────
-
-local function findHead(player)
-    local char = player.Character
-    if not char then return nil end
-    -- Sprawdź standardową głowę
-    local h = char:FindFirstChild("Head")
-    if h then return h end
-    -- Fallback: pierwsze BasePart z nazwą Head (na wypadek niestandardowych avatarów)
-    for _, v in char:GetDescendants() do
-        if v:IsA("BasePart") and v.Name == "Head" then
-            return v
+-- Tick per-player bez goto — wyodrębniony jako funkcja
+local function tickPlayer(player,data,dt,lpRoot)
+    -- Watchdog: brak billboardu lub zły adornee
+    if enabled and not data.building and data.fadeState~="out" then
+        local head=findHead(player)
+        if head and head.Parent then
+            if not data.refs then
+                attachToHead(player,head,false)
+                return
+            elseif data.refs.billboard and data.refs.billboard.Parent then
+                if data.refs.billboard.Adornee~=head then
+                    data.refs.billboard.Adornee=head
+                    if data.refs.shadowBB then data.refs.shadowBB.Adornee=head end
+                end
+            end
         end
     end
-    return nil
-end
 
--- ─────────────────────────────────────────────
---   Globalna pętla Heartbeat
--- ─────────────────────────────────────────────
+    if not data.refs then return end
+    local refs=data.refs
+
+    -- Anti-zombie
+    if not refs.billboard or not refs.billboard.Parent then
+        data.refs=nil data.fadeState="idle" data.fadeAlpha=1 data.currentTrans=1
+        return
+    end
+
+    -- AdorneeParent=nil (stara glowa odlaczona po ;spongify itp.)
+    if refs.billboard.Adornee and refs.billboard.Adornee.Parent==nil then
+        local newHead=findHead(player)
+        if newHead and newHead.Parent then
+            refs.billboard.Adornee=newHead
+            if refs.shadowBB then refs.shadowBB.Adornee=newHead end
+        end
+    end
+
+    -- Per-player fade
+    local fadeState=data.fadeState
+    if fadeState=="in" then
+        data.fadeAlpha=data.fadeAlpha+(0-data.fadeAlpha)*(1-exp(-CFG.PlayerFadeInSpeed*dt))
+        if abs(data.fadeAlpha)<0.005 then
+            data.fadeAlpha=0 data.fadeState="idle" fadeState="idle"
+        end
+    elseif fadeState=="out" then
+        data.fadeAlpha=data.fadeAlpha+(1-data.fadeAlpha)*(1-exp(-CFG.PlayerFadeOutSpeed*dt))
+        if data.fadeAlpha>0.995 then
+            data.fadeAlpha=1 data.fadeState="idle" data.currentTrans=1
+            if refs.billboard and refs.billboard.Parent then
+                pcall(function() refs.billboard:Destroy() end)
+            end
+            if refs.shadowBB and refs.shadowBB.Parent then
+                pcall(function() refs.shadowBB:Destroy() end)
+            end
+            data.refs=nil
+            return
+        end
+    end
+
+    -- Finalna przezroczystosc
+    local finalTrans
+    if fadeState=="idle" then
+        finalTrans=masterAlpha data.currentTrans=finalTrans
+    else
+        local targetTrans=max(masterAlpha,data.fadeAlpha)
+        local cur=data.currentTrans
+        cur=cur+(targetTrans-cur)*(1-exp(-CFG.LerpSpeed*dt))
+        data.currentTrans=cur finalTrans=cur
+    end
+    refs.canvas.GroupTransparency=finalTrans
+    refs.shadowCanvas.GroupTransparency=finalTrans
+
+    -- Dystans
+    local char=player.Character
+    local head=char and char:FindFirstChild("Head")
+    if lpRoot and head then
+        data.distTimer=(data.distTimer or 0)+dt
+        if data.distTimer>=CFG.DistThrottle then
+            data.distTimer=0
+            local dist=(head.Position-lpRoot.Position).Magnitude
+            local dc=distColor(dist)
+            refs.distLabel.Text=format("%.0f studs",floor(dist))
+            refs.distDot.TextColor3=dc
+            refs.distLabel.TextColor3=dc
+        end
+    end
+end
 
 local function startGlobalHeartbeat()
-    if globalHeartbeat then
-        globalHeartbeat:Disconnect()
-        globalHeartbeat = nil
-    end
-
-    globalHeartbeat = RunService.Heartbeat:Connect(function(dt)
-        local lpChar = lp.Character
-        local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-
-        for player, data in tagData do
-            -- ── FIX v19.1: Watchdog — sprawdź czy billboard ma właściwy adornee ──
-            -- Przypadki: ;char, ;spongify, ;frogify → Character zostaje zastąpiony
-            -- bez CharacterRemoving/CharacterAdded, albo Head zmienia rodzica
-            if enabled and not data.building and data.fadeState ~= "out" then
-                local char = player.Character
-                local head = char and findHead(player)
-
-                if head and head.Parent then
-                    -- Głowa istnieje w workspace
-                    if not data.refs then
-                        -- Billboard brakuje mimo że gracz ma głowę → odbuduj
-                        attachToHead(player, head, false)
-                    elseif data.refs.billboard and data.refs.billboard.Parent then
-                        -- Billboard istnieje — sprawdź czy adornee wskazuje na właściwą głowę
-                        if data.refs.billboard.Adornee ~= head then
-                            -- Głowa się zmieniła (;char, ;spongify itp.) → re-attach
-                            data.refs.billboard.Adornee = head
-                            if data.refs.shadowBB then
-                                data.refs.shadowBB.Adornee = head
-                            end
-                        end
-                    end
-                elseif not head and data.refs and data.refs.billboard and data.refs.billboard.Parent then
-                    -- Gracz żyje ale Head zniknął tymczasowo (wymiana avatara w toku)
-                    -- Nie kasujemy billboardu — poczekamy na watchdoga w następnej klatce
-                    -- Adornee=nil automatycznie ukryje billboard (Roblox go nie renderuje)
-                    -- (nie robimy nic — naturalny stan przejściowy)
-                end
-            end
-
-            -- ── Anti-zombie: billboard bez rodzica ───────────────────────────────
-            if not data.refs then goto continue end
-
-            local refs = data.refs
-            if not refs.billboard or not refs.billboard.Parent then
-                -- Billboard zniknął z zewnątrz
-                data.refs         = nil
-                data.fadeState    = "idle"
-                data.fadeAlpha    = 1
-                data.currentTrans = 1
-                goto continue
-            end
-
-            -- ── FIX v19.1: AdorneeParent=nil — stara głowa odłączona ─────────────
-            -- Gdy ;spongify podmienia postać, stara głowa może wisieć odłączona
-            -- billboard.Adornee nadal wskazuje na tę głowę ale jej .Parent = nil
-            if refs.billboard.Adornee and refs.billboard.Adornee.Parent == nil then
-                -- Szukaj nowej głowy
-                local newHead = findHead(player)
-                if newHead and newHead.Parent then
-                    refs.billboard.Adornee = newHead
-                    if refs.shadowBB then
-                        refs.shadowBB.Adornee = newHead
-                    end
-                end
-                -- Jeśli nie ma jeszcze nowej głowy — billboard jest niewidoczny naturalnie
-                -- (Roblox nie renderuje BillboardGui bez adornee w workspace)
-            end
-
-            -- ── Per-player fade ───────────────────────────────────────────────────
-            local fadeState = data.fadeState
-
-            if fadeState == "in" then
-                data.fadeAlpha = data.fadeAlpha + (0 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeInSpeed * dt))
-                if abs(data.fadeAlpha) < 0.005 then
-                    data.fadeAlpha = 0
-                    data.fadeState = "idle"
-                end
-            elseif fadeState == "out" then
-                data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
-                if data.fadeAlpha > 0.995 then
-                    data.fadeAlpha    = 1
-                    data.fadeState    = "idle"
-                    data.currentTrans = 1
-                    if refs.billboard and refs.billboard.Parent then
-                        pcall(function() refs.billboard:Destroy() end)
-                    end
-                    if refs.shadowBB and refs.shadowBB.Parent then
-                        pcall(function() refs.shadowBB:Destroy() end)
-                    end
-                    data.refs = nil
-                    goto continue
-                end
-            end
-
-            -- ── Finalna przezroczystość ───────────────────────────────────────────
-            local finalTrans
-            if fadeState == "idle" then
-                finalTrans        = masterAlpha
-                data.currentTrans = finalTrans
-            else
-                local targetTrans = max(masterAlpha, data.fadeAlpha)
-                local cur         = data.currentTrans
-                cur               = cur + (targetTrans - cur) * (1 - exp(-CFG.LerpSpeed * dt))
-                data.currentTrans = cur
-                finalTrans        = cur
-            end
-
-            refs.canvas.GroupTransparency       = finalTrans
-            refs.shadowCanvas.GroupTransparency = finalTrans
-
-            -- ── Dystans ───────────────────────────────────────────────────────────
-            local char = player.Character
-            local head = char and char:FindFirstChild("Head")
-
-            if lpRoot and head then
-                data.distTimer = (data.distTimer or 0) + dt
-                if data.distTimer >= CFG.DistThrottle then
-                    data.distTimer = 0
-                    local dist = (head.Position - lpRoot.Position).Magnitude
-                    local dc   = distColor(dist)
-                    refs.distLabel.Text       = format("%.0f studs", floor(dist))
-                    refs.distDot.TextColor3   = dc
-                    refs.distLabel.TextColor3 = dc
-                end
-            end
-
-            ::continue::
+    if globalHeartbeat then globalHeartbeat:Disconnect() globalHeartbeat=nil end
+    globalHeartbeat=RunService.Heartbeat:Connect(function(dt)
+        local lpChar=lp.Character
+        local lpRoot=lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+        for player,data in pairs(tagData) do
+            tickPlayer(player,data,dt,lpRoot)
         end
     end)
 end
 
--- ─────────────────────────────────────────────
---   Inicjalizacja / cleanup gracza
--- ─────────────────────────────────────────────
-
 local function cleanupPlayer(player)
-    local data = tagData[player]
+    local data=tagData[player]
     if not data then return end
     if data.charConns then
-        for _, conn in data.charConns do
-            conn:Disconnect()
-        end
-        data.charConns = nil
+        for _,conn in ipairs(data.charConns) do conn:Disconnect() end
+        data.charConns=nil
     end
-    destroyTagUI(player, false)
-    widthCache[player.UserId] = nil
-    tagData[player] = nil
+    destroyTagUI(player,false)
+    widthCache[player.UserId]=nil
+    tagData[player]=nil
 end
 
 local function setupPlayer(player)
-    if player == lp then return end
+    if player==lp then return end
     if tagData[player] then return end
 
-    tagData[player] = {
-        refs         = nil,
-        charConns    = nil,
-        fadeState    = "idle",
-        fadeAlpha    = 1,
-        building     = false,
-        distTimer    = 0,
-        currentTrans = 1,
+    tagData[player]={
+        refs=nil, charConns=nil, fadeState="idle",
+        fadeAlpha=1, building=false, distTimer=0, currentTrans=1,
     }
+    local data=tagData[player]
 
-    local data = tagData[player]
-
-    local charAdded = player.CharacterAdded:Connect(function(newChar)
+    local charAdded=player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
-            -- FIX v19.1: czekaj na Head z timeoutem 8s zamiast 5s
-            -- (zbanowane avatary / duże modele ładują się dłużej)
-            local head = newChar:WaitForChild("Head", 8)
-            if not head then
-                -- Fallback: szukaj Head w całym modelu (niestandardowe avatary)
-                head = findHead(player)
-            end
+            local head=newChar:WaitForChild("Head",8)
+            if not head then head=findHead(player) end
             if not head or not tagData[player] then return end
             if not enabled then return end
 
-            -- Czekaj aż Head będzie w workspace (nie tylko w modelu)
-            local waited = 0
-            while head.Parent == nil and waited < 5 do
-                task.wait(0.1)
-                waited += 0.1
+            local waited=0
+            while head.Parent==nil and waited<5 do
+                task.wait(0.1) waited=waited+0.1
             end
-            if head.Parent == nil then return end
+            if head.Parent==nil then return end
 
-            -- Fade-out starego billboardu (jeśli istnieje) potem fade-in nowego
-            local d = tagData[player]
+            local d=tagData[player]
             if d and d.refs then
-                d.fadeState = "out"
-                task.wait(0.5) -- poczekaj na fade-out
+                d.fadeState="out"
+                task.wait(0.5)
             end
-
             if not tagData[player] then return end
             if not enabled then return end
 
-            -- Pobierz aktualną głowę (może się zmienić podczas oczekiwania)
-            local currentHead = findHead(player)
+            local currentHead=findHead(player)
             if currentHead and currentHead.Parent then
-                attachToHead(player, currentHead, false)
+                attachToHead(player,currentHead,false)
             end
         end)
     end)
 
-    -- FIX v19.1: Backup przez ChildAdded na player — łapie ;char kiedy
-    -- CharacterAdded nie odpala, oraz przypadki gdy Character jest podmieniony
-    -- bezpośrednio (HD Admin robi player.Character = nowyModel)
-    local childAdded = player.ChildAdded:Connect(function(child)
-        -- HD Admin tworzy nowy model i ustawia go jako Character
-        -- Nowy model pojawia się jako child playera
-        if child:IsA("Model") and child.Name == player.Name then
+    -- Backup dla HD Admin ;char — lapie nowy Model bez CharacterAdded
+    local childAdded=player.ChildAdded:Connect(function(child)
+        if child:IsA("Model") and child.Name==player.Name then
             task.spawn(function()
                 if not enabled then return end
-                local d = tagData[player]
+                local d=tagData[player]
                 if not d then return end
-
-                -- Poczekaj chwilę na załadowanie modelu
                 task.wait(0.3)
-
-                local head = child:FindFirstChild("Head")
-                if not head then
-                    -- Dodatkowe oczekiwanie dla wolnych avatarów
-                    task.wait(1)
-                    head = child:FindFirstChild("Head")
-                end
+                local head=child:FindFirstChild("Head")
+                if not head then task.wait(1) head=child:FindFirstChild("Head") end
                 if not head or not head.Parent then return end
                 if not enabled or not tagData[player] then return end
-
-                -- Usuń stary billboard natychmiast (bez fade)
                 if d.refs then
                     if d.refs.billboard and d.refs.billboard.Parent then
                         pcall(function() d.refs.billboard:Destroy() end)
@@ -759,115 +525,74 @@ local function setupPlayer(player)
                     if d.refs.shadowBB and d.refs.shadowBB.Parent then
                         pcall(function() d.refs.shadowBB:Destroy() end)
                     end
-                    d.refs      = nil
-                    d.fadeState = "idle"
-                    d.fadeAlpha = 1
-                    d.building  = false
+                    d.refs=nil d.fadeState="idle" d.fadeAlpha=1 d.building=false
                 end
-
-                attachToHead(player, head, false)
+                attachToHead(player,head,false)
             end)
         end
     end)
 
-    local charRemoving = player.CharacterRemoving:Connect(function()
-        local d = tagData[player]
-        if d and d.refs then
-            d.fadeState = "out"
-        end
+    local charRemoving=player.CharacterRemoving:Connect(function()
+        local d=tagData[player]
+        if d and d.refs then d.fadeState="out" end
     end)
 
-    data.charConns = { charAdded, charRemoving, childAdded }
+    data.charConns={charAdded,charRemoving,childAdded}
 
     if enabled then
-        local head = findHead(player)
-        if head and head.Parent then
-            attachToHead(player, head, false)
-        end
+        local head=findHead(player)
+        if head and head.Parent then attachToHead(player,head,false) end
     end
 end
 
--- ─────────────────────────────────────────────
---   Publiczne API
--- ─────────────────────────────────────────────
-
 getgenv().Nametags = {
-
     enable = function()
         if enabled and not isTransitioning then return end
-        isTransitioning = true
-        enabled = true
-
-        if masterAlphaConn then
-            masterAlphaConn:Disconnect()
-            masterAlphaConn = nil
-        end
-        masterAlpha = 1
-
+        isTransitioning=true enabled=true
+        if masterAlphaConn then masterAlphaConn:Disconnect() masterAlphaConn=nil end
+        masterAlpha=1
         startGlobalHeartbeat()
-
-        for _, player in Players:GetPlayers() do
-            if player == lp then continue end
-            if not tagData[player] then
-                setupPlayer(player)
-            end
-            local data = tagData[player]
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player==lp then continue end
+            if not tagData[player] then setupPlayer(player) end
+            local data=tagData[player]
             if not data then continue end
-            if data.fadeState == "out" then continue end
-
-            data.fadeState    = "idle"
-            data.fadeAlpha    = 0
-            data.currentTrans = 1
-
-            local head = findHead(player)
+            if data.fadeState=="out" then continue end
+            data.fadeState="idle" data.fadeAlpha=0 data.currentTrans=1
+            local head=findHead(player)
             if head and head.Parent and not data.building then
-                attachToHead(player, head, true)
+                attachToHead(player,head,true)
             elseif data.refs then
-                data.refs.canvas.GroupTransparency       = 1
-                data.refs.shadowCanvas.GroupTransparency = 1
-                data.currentTrans = 1
+                data.refs.canvas.GroupTransparency=1
+                data.refs.shadowCanvas.GroupTransparency=1
+                data.currentTrans=1
             end
         end
-
-        animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
-            isTransitioning = false
-        end)
+        animateMasterAlpha(0,CFG.ToggleLerpSpeed,function() isTransitioning=false end)
     end,
 
     disable = function()
         if not enabled and not isTransitioning then return end
-        enabled = false
-        isTransitioning = true
-
-        for _, data in tagData do
-            if data.fadeState == "in" then
-                data.fadeState = "idle"
-                data.fadeAlpha = 0
-            end
+        enabled=false isTransitioning=true
+        for _,data in pairs(tagData) do
+            if data.fadeState=="in" then data.fadeState="idle" data.fadeAlpha=0 end
         end
-
-        animateMasterAlpha(1, CFG.ToggleLerpSpeed, function()
-            isTransitioning = false
-            if globalHeartbeat then
-                globalHeartbeat:Disconnect()
-                globalHeartbeat = nil
-            end
-            for player, _ in tagData do
-                destroyTagUI(player, false)
-            end
-            widthCache = {}
+        animateMasterAlpha(1,CFG.ToggleLerpSpeed,function()
+            isTransitioning=false
+            if globalHeartbeat then globalHeartbeat:Disconnect() globalHeartbeat=nil end
+            for player,_ in pairs(tagData) do destroyTagUI(player,false) end
+            widthCache={}
         end)
     end,
 
     setColor = function(color)
-        accentColor = color
-        local newGradient = accentGradientColor(color)
-        for _, data in tagData do
+        accentColor=color
+        local ng=accentGradientColor(color)
+        for _,data in pairs(tagData) do
             if data.refs then
-                local refs = data.refs
-                refs.accentBar.BackgroundColor3 = color
-                refs.accentGrad.Color           = newGradient
-                refs.ring.BackgroundColor3      = color
+                data.refs.accentBar.BackgroundColor3=color
+                data.refs.accentGrad.Color=ng
+                data.refs.ring.BackgroundColor3=color
             end
         end
     end,
@@ -877,25 +602,18 @@ getgenv().enableNametags     = getgenv().Nametags.enable
 getgenv().disableNametags    = getgenv().Nametags.disable
 getgenv().updateNametagColor = getgenv().Nametags.setColor
 
--- ─────────────────────────────────────────────
---   Zdarzenia globalne
--- ─────────────────────────────────────────────
-
 Players.PlayerAdded:Connect(setupPlayer)
-
 Players.PlayerRemoving:Connect(function(player)
-    local data = tagData[player]
+    local data=tagData[player]
     if not data then return end
     if data.refs then
-        destroyTagUI(player, true)
-        task.delay(1.2, function()
-            cleanupPlayer(player)
-        end)
+        destroyTagUI(player,true)
+        task.delay(1.2,function() cleanupPlayer(player) end)
     else
         cleanupPlayer(player)
     end
 end)
 
-for _, player in Players:GetPlayers() do
+for _,player in ipairs(Players:GetPlayers()) do
     setupPlayer(player)
 end
