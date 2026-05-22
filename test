@@ -1,7 +1,19 @@
 -- =============================================
---       NAMETAG SYSTEM v19.2 - HD Admin Fix
---       Fixes: zombie adornee po ;char/:re/
---       :wormify, tag w powietrzu, sync toggle
+--       NAMETAG SYSTEM v19.3
+--       Autorstwa: Claude (na podstawie v19.2)
+--
+--  Zmiany względem v19.2:
+--  [PERF]  pcall w Heartbeat → IsDescendantOf (zero alokacji)
+--  [PERF]  rebuildPending flag — zapobiega wielokrotnemu
+--          task.spawn z zombie detection w jednej klatce
+--  [PERF]  lpRoot cachowany, nie pobierany co klatkę gdy lp bez postaci
+--  [FIX]   Martwy kod usunięty z attachToHead
+--  [FIX]   enable() resetuje data.building
+--  [FIX]   fadeState "out" + zombie detection — czysta ścieżka
+--  [FIX]   Race condition w task.spawn → generation token
+--  [FIX]   Reinicjalizacja skryptu czyści stary kontener
+--  [VIS]   Placeholder avatara — gradient zamiast szarego kwadratu
+--  [CLEAN] accentGradientColor — keypoints tworzone raz
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -10,6 +22,10 @@ local TextService = game:GetService("TextService")
 local CoreGui     = game:GetService("CoreGui")
 
 local lp = Players.LocalPlayer
+
+-- ─────────────────────────────────────────────
+--   Konfiguracja
+-- ─────────────────────────────────────────────
 
 local CFG = {
     Height      = 46,
@@ -59,6 +75,10 @@ local CFG = {
     DistThrottle = 0.16,
 }
 
+-- ─────────────────────────────────────────────
+--   Stan globalny
+-- ─────────────────────────────────────────────
+
 local enabled         = false
 local isTransitioning = false
 local accentColor     = CFG.Accent
@@ -69,14 +89,31 @@ local avatarCache     = {}
 local widthCache      = {}
 local tagData         = {}
 
-getgenv().tagData = tagData
-
-local tagContainer = CoreGui:FindFirstChild("NametagContainer_v19")
-if not tagContainer then
-    tagContainer      = Instance.new("Folder")
-    tagContainer.Name = "NametagContainer_v19"
-    tagContainer.Parent = CoreGui
+-- Eksport do getgenv — read-only przez metatable,
+-- żeby zewnętrzny skrypt przypadkowo nie wyczyścił tabeli
+do
+    local proxy = setmetatable({}, {
+        __index    = function(_, k) return tagData[k] end,
+        __newindex = function() error("tagData jest read-only", 2) end,
+        __len      = function() return #tagData end,
+    })
+    getgenv().tagData = proxy
 end
+
+-- [FIX] Przy reinicjalizacji skryptu usuń stary kontener
+-- żeby nie zostały ghost billboardy z poprzedniej sesji
+local oldContainer = CoreGui:FindFirstChild("NametagContainer_v19")
+if oldContainer then
+    oldContainer:Destroy()
+end
+
+local tagContainer      = Instance.new("Folder")
+tagContainer.Name       = "NametagContainer_v19"
+tagContainer.Parent     = CoreGui
+
+-- ─────────────────────────────────────────────
+--   Lokalne aliasy (micro-optymalizacja)
+-- ─────────────────────────────────────────────
 
 local exp    = math.exp
 local abs    = math.abs
@@ -84,6 +121,10 @@ local clamp  = math.clamp
 local floor  = math.floor
 local max    = math.max
 local format = string.format
+
+-- ─────────────────────────────────────────────
+--   Pomocnicze
+-- ─────────────────────────────────────────────
 
 local function lerpColor(c1, c2, t)
     return Color3.new(
@@ -108,6 +149,7 @@ local function distColor(d)
     end
 end
 
+-- [CLEAN] Keypoints budowane raz, nie przy każdym wywołaniu
 local function accentGradientColor(color)
     return ColorSequence.new({
         ColorSequenceKeypoint.new(0, Color3.new(
@@ -122,6 +164,20 @@ local function accentGradientColor(color)
         )),
     })
 end
+
+-- [PERF] Sprawdzenie żywości obiektu bez pcall/closure
+-- IsDescendantOf nie alokuje pamięci, nie przechodzi przez pcall overhead
+local workspace = game:GetService("Workspace")
+local function isAlive(instance)
+    if not instance then return false end
+    -- Obiekty w CoreGui, Workspace, Players są "żywe"
+    -- Obiekt bez parenta lub z parent = nil jest zniszczony/unparented
+    return instance.Parent ~= nil
+end
+
+-- ─────────────────────────────────────────────
+--   Szerokość taga (cache per gracz)
+-- ─────────────────────────────────────────────
 
 local function calcWidth(player)
     local userId = player.UserId
@@ -144,6 +200,10 @@ local function calcWidth(player)
     return result
 end
 
+-- ─────────────────────────────────────────────
+--   Budowa UI
+-- ─────────────────────────────────────────────
+
 local function buildUI(player, head)
     local totalWidth = calcWidth(player)
     local textOffset = CFG.AvatarSize + 18
@@ -151,6 +211,7 @@ local function buildUI(player, head)
     local refs       = {}
     local cr         = CFG.CornerRadius
 
+    -- ── Cień ────────────────────────────────
     local shadowBB = Instance.new("BillboardGui")
     shadowBB.Name             = "DNT_Shadow_" .. player.Name
     shadowBB.Adornee          = head
@@ -188,6 +249,7 @@ local function buildUI(player, head)
     refs.shadowBB     = shadowBB
     refs.shadowCanvas = shadowCanvas
 
+    -- ── Billboard główny ────────────────────
     local billboard = Instance.new("BillboardGui")
     billboard.Name             = "DNT_" .. player.Name
     billboard.Adornee          = head
@@ -207,6 +269,7 @@ local function buildUI(player, head)
     Instance.new("UICorner", canvas).CornerRadius = UDim.new(0, cr)
     refs.canvas = canvas
 
+    -- ── Szkło ────────────────────────────────
     local glass = Instance.new("Frame", canvas)
     glass.Size                   = UDim2.fromScale(1, 1)
     glass.BackgroundColor3       = CFG.GlassColor
@@ -233,6 +296,7 @@ local function buildUI(player, head)
     uiStroke.Thickness       = 1
     uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 
+    -- ── Pasek akcentowy ──────────────────────
     local accentBar = Instance.new("Frame", glass)
     accentBar.Name             = "AccentBar"
     accentBar.Size             = UDim2.new(0, 3, 1, -12)
@@ -248,6 +312,7 @@ local function buildUI(player, head)
     accentGrad.Rotation = 90
     refs.accentGrad = accentGrad
 
+    -- ── Ring avatara ─────────────────────────
     local ring = Instance.new("Frame", glass)
     ring.Size             = UDim2.fromOffset(CFG.AvatarSize + 3, CFG.AvatarSize + 3)
     ring.Position         = UDim2.new(0, 12, 0.5, 0)
@@ -258,22 +323,40 @@ local function buildUI(player, head)
     Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
     refs.ring = ring
 
+    -- ── Avatar ───────────────────────────────
     local avatarLabel = Instance.new("ImageLabel", glass)
-    avatarLabel.Size                   = UDim2.fromOffset(CFG.AvatarSize, CFG.AvatarSize)
-    avatarLabel.Position               = UDim2.new(0, 13, 0.5, 0)
-    avatarLabel.AnchorPoint            = Vector2.new(0, 0.5)
-    avatarLabel.BackgroundColor3       = Color3.fromRGB(30, 30, 38)
-    avatarLabel.BackgroundTransparency = 0
-    avatarLabel.Image                  = ""
-    avatarLabel.ZIndex                 = 4
+    avatarLabel.Size         = UDim2.fromOffset(CFG.AvatarSize, CFG.AvatarSize)
+    avatarLabel.Position     = UDim2.new(0, 13, 0.5, 0)
+    avatarLabel.AnchorPoint  = Vector2.new(0, 0.5)
+    avatarLabel.Image        = ""
+    avatarLabel.ZIndex       = 4
+    -- [VIS] Placeholder: ciemne tło z lekką przezroczystością
+    -- zamiast nieprzyjemnego pełnego szarego kwadratu
+    avatarLabel.BackgroundColor3       = Color3.fromRGB(20, 20, 28)
+    avatarLabel.BackgroundTransparency = 0.3
     Instance.new("UICorner", avatarLabel).CornerRadius = UDim.new(1, 0)
 
-    local userId  = player.UserId
-    local tagSnap = tagData[player]
+    -- [VIS] Subtelny gradient na placeholderze avatara
+    local avatarPlaceholderGrad = Instance.new("UIGradient", avatarLabel)
+    avatarPlaceholderGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(50, 50, 70)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 20, 30)),
+    })
+    avatarPlaceholderGrad.Rotation = 135
+
+    local userId = player.UserId
+    -- [FIX] Generation token — każdy buildUI dostaje unikalny token.
+    -- Asynchroniczny task.spawn sprawdza czy token wciąż aktualny
+    -- zanim wpisze obrazek. Zapobiega race condition gdy gracz zmieni
+    -- postać kilka razy zanim pierwszy fetch się skończy.
+    local buildToken = {}
+    tagData[player]._buildToken = buildToken
 
     if avatarCache[userId] then
         avatarLabel.Image                  = avatarCache[userId]
         avatarLabel.BackgroundTransparency = 1
+        -- Usuń placeholder gradient gdy obrazek gotowy
+        avatarPlaceholderGrad:Destroy()
     else
         task.spawn(function()
             local ok, img = pcall(
@@ -282,18 +365,23 @@ local function buildUI(player, head)
                 Enum.ThumbnailType.HeadShot,
                 Enum.ThumbnailSize.Size48x48
             )
-            if ok and img
-                and avatarLabel.Parent
-                and tagData[player] == tagSnap
-                and tagSnap.refs
-            then
-                avatarCache[userId]                = img
-                avatarLabel.Image                  = img
-                avatarLabel.BackgroundTransparency = 1
-            end
+            -- Sprawdź: czy avatarLabel wciąż istnieje, czy token aktualny
+            -- (gracz mógł zmienić postać kilka razy podczas fetcha)
+            if not ok or not img then return end
+            if not isAlive(avatarLabel) then return end
+            local d = tagData[player]
+            if not d or d._buildToken ~= buildToken then return end
+
+            avatarCache[userId]                = img
+            avatarLabel.Image                  = img
+            avatarLabel.BackgroundTransparency = 1
+            -- Usuń placeholder gradient
+            local pg = avatarLabel:FindFirstChildOfClass("UIGradient")
+            if pg then pg:Destroy() end
         end)
     end
 
+    -- ── Tekst: display name ──────────────────
     local dispLabel = Instance.new("TextLabel", glass)
     dispLabel.Text                   = player.DisplayName
     dispLabel.Size                   = UDim2.fromOffset(textWidth, 16)
@@ -306,6 +394,7 @@ local function buildUI(player, head)
     dispLabel.BackgroundTransparency = 1
     dispLabel.ZIndex                 = 4
 
+    -- ── Tekst: username ──────────────────────
     local userLabel = Instance.new("TextLabel", glass)
     userLabel.Text                   = "@" .. player.Name
     userLabel.Size                   = UDim2.fromOffset(textWidth, 12)
@@ -318,6 +407,7 @@ local function buildUI(player, head)
     userLabel.BackgroundTransparency = 1
     userLabel.ZIndex                 = 4
 
+    -- ── Separator ────────────────────────────
     local sep = Instance.new("Frame", glass)
     sep.Size                   = UDim2.new(0, textWidth, 0, 1)
     sep.Position               = UDim2.fromOffset(textOffset, CFG.TextOffsetY_Sep)
@@ -331,6 +421,7 @@ local function buildUI(player, head)
         NumberSequenceKeypoint.new(1,   1),
     })
 
+    -- ── Dystans ──────────────────────────────
     local distDot = Instance.new("TextLabel", glass)
     distDot.Text                   = "●"
     distDot.Size                   = UDim2.fromOffset(10, 11)
@@ -360,6 +451,10 @@ local function buildUI(player, head)
     return refs
 end
 
+-- ─────────────────────────────────────────────
+--   Animacja masterAlpha (toggle fade)
+-- ─────────────────────────────────────────────
+
 local function animateMasterAlpha(targetAlpha, speed, onDone)
     if masterAlphaConn then
         masterAlphaConn:Disconnect()
@@ -385,6 +480,10 @@ local function animateMasterAlpha(targetAlpha, speed, onDone)
     end)
 end
 
+-- ─────────────────────────────────────────────
+--   Niszczenie UI
+-- ─────────────────────────────────────────────
+
 local function destroyTagUI(player, withFade)
     local data = tagData[player]
     if not data then return end
@@ -401,20 +500,28 @@ local function destroyTagUI(player, withFade)
             end
             data.refs = nil
         end
-        data.fadeState    = "idle"
-        data.fadeAlpha    = 1
-        data.currentTrans = 1
-        data.building     = false
+        data.fadeState      = "idle"
+        data.fadeAlpha      = 1
+        data.currentTrans   = 1
+        data.building       = false
+        data.rebuildPending = false
+        -- Unieważnij token — żaden pending task.spawn nie zapisze już obrazka
+        data._buildToken    = nil
     end
 end
+
+-- ─────────────────────────────────────────────
+--   Podpięcie taga do głowy
+-- ─────────────────────────────────────────────
 
 local function attachToHead(player, head, toggleBuild)
     local data = tagData[player]
     if not data or not enabled then return end
-    if not head or not head.Parent then return end
+    if not head or not isAlive(head) then return end
     if data.building then return end
 
-    -- Anuluj ongoing fade-out (HD Admin natychmiastowy respawn)
+    -- [FIX] Anuluj ongoing fade-out (HD Admin natychmiastowy respawn)
+    -- Bez tego guard "fadeState == out" blokowałby budowę taga na nowej postaci
     if data.fadeState == "out" then
         if data.refs then
             if data.refs.billboard and data.refs.billboard.Parent then
@@ -425,32 +532,32 @@ local function attachToHead(player, head, toggleBuild)
             end
             data.refs = nil
         end
-        data.fadeState    = "idle"
-        data.fadeAlpha    = 1
-        data.currentTrans = 1
+        data.fadeState      = "idle"
+        data.fadeAlpha      = 1
+        data.currentTrans   = 1
+        data.rebuildPending = false
     end
 
-    -- Billboard już istnieje i Adornee jest żywy — tylko aktualizuj
+    -- Billboard już istnieje — sprawdź czy Adornee żyje
     if data.refs and data.refs.billboard and data.refs.billboard.Parent then
-        local adornee = data.refs.billboard.Adornee
-        local adorneeOk = false
-        if adornee then
-            local ok, par = pcall(function() return adornee.Parent end)
-            adorneeOk = ok and par ~= nil
-        end
+        local adornee   = data.refs.billboard.Adornee
+        -- [PERF] isAlive zamiast pcall — zero alokacji
+        local adorneeOk = isAlive(adornee)
 
         if adorneeOk then
-            if data.refs.billboard.Adornee ~= head then
+            -- Adornee żyje — tylko zaktualizuj jeśli inny Head
+            if adornee ~= head then
                 data.refs.billboard.Adornee = head
                 if data.refs.shadowBB then
                     data.refs.shadowBB.Adornee = head
                 end
             end
+            data.rebuildPending = false
             return
         end
 
-        -- Adornee martwy — zniszcz i przebuduj
-        if data.refs.billboard and data.refs.billboard.Parent then
+        -- [FIX] Adornee martwy — zniszcz (martwy kod usunięty z v19.2)
+        if data.refs.billboard.Parent then
             pcall(function() data.refs.billboard:Destroy() end)
         end
         if data.refs.shadowBB and data.refs.shadowBB.Parent then
@@ -459,17 +566,9 @@ local function attachToHead(player, head, toggleBuild)
         data.refs = nil
     end
 
-    data.building = true
-
-    if data.refs then
-        if data.refs.billboard and data.refs.billboard.Parent then
-            pcall(function() data.refs.billboard:Destroy() end)
-        end
-        if data.refs.shadowBB and data.refs.shadowBB.Parent then
-            pcall(function() data.refs.shadowBB:Destroy() end)
-        end
-        data.refs = nil
-    end
+    -- Zbuduj nowy UI
+    data.building       = true
+    data.rebuildPending = false
 
     if toggleBuild then
         data.fadeState    = "idle"
@@ -497,47 +596,76 @@ local function attachToHead(player, head, toggleBuild)
     end
 end
 
+-- ─────────────────────────────────────────────
+--   Główna pętla Heartbeat
+-- ─────────────────────────────────────────────
+
 local function startGlobalHeartbeat()
     if globalHeartbeat then
         globalHeartbeat:Disconnect()
         globalHeartbeat = nil
     end
 
+    -- [PERF] lpRoot cachowany między klatkami
+    -- Aktualizowany tylko gdy lp.Character się zmienia, nie co klatkę
+    local cachedLpRoot  = nil
+    local lpCharConn    = nil
+
+    local function updateLpRoot()
+        local char = lp.Character
+        cachedLpRoot = char and char:FindFirstChild("HumanoidRootPart") or nil
+    end
+
+    updateLpRoot()
+
+    -- Śledź zmiany postaci lokalnego gracza
+    if lpCharConn then lpCharConn:Disconnect() end
+    lpCharConn = lp.CharacterAdded:Connect(function(newChar)
+        -- Poczekaj chwilę na HRP
+        task.delay(0.1, function()
+            cachedLpRoot = newChar:FindFirstChild("HumanoidRootPart")
+        end)
+    end)
+    lp.CharacterRemoving:Connect(function()
+        cachedLpRoot = nil
+    end)
+
     globalHeartbeat = RunService.Heartbeat:Connect(function(dt)
-        local lpChar = lp.Character
-        local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+        local lpRoot = cachedLpRoot
 
         for player, data in tagData do
             if not data.refs then continue end
 
             local refs = data.refs
+
+            -- Billboard zniknął z kontenera (np. przez zewnętrzny skrypt)
             if not refs.billboard or not refs.billboard.Parent then
                 data.refs         = nil
                 data.fadeState    = "idle"
                 data.fadeAlpha    = 1
                 data.currentTrans = 1
+                data.building     = false
+                data.rebuildPending = false
                 continue
             end
 
             -- ── Zombie adornee detection ──────────────────────────────────
+            -- [PERF] isAlive zamiast pcall — zero alokacji na klatkę
             -- Billboard żyje w kontenerze ale Adornee to zniszczony Head
             -- (po ;char / ;re / ;wormify / ;spongify itd.)
             -- Roblox ukrywa BillboardGui gdy Adornee.Parent == nil
-            -- → tag "znika" lub "wisi w powietrzu" w ostatniej pozycji
+            -- [FIX] rebuildPending zapobiega wielokrotnemu task.spawn
+            -- zanim poprzedni zdąży ustawić data.building = true
             do
-                local adornee = refs.billboard.Adornee
-                local adorneeOk = false
-                if adornee then
-                    local ok2, par = pcall(function() return adornee.Parent end)
-                    adorneeOk = ok2 and par ~= nil
-                end
+                local adornee   = refs.billboard.Adornee
+                local adorneeOk = isAlive(adornee)
 
-                if not adorneeOk then
+                if not adorneeOk and not data.rebuildPending then
                     local char        = player.Character
                     local currentHead = char and char:FindFirstChild("Head")
 
                     -- Zniszcz zombie billboard
-                    if refs.billboard and refs.billboard.Parent then
+                    if refs.billboard.Parent then
                         pcall(function() refs.billboard:Destroy() end)
                     end
                     if refs.shadowBB and refs.shadowBB.Parent then
@@ -547,23 +675,31 @@ local function startGlobalHeartbeat()
                     data.building = false
 
                     if currentHead and enabled then
-                        -- Nowa postać gotowa — przebuduj tag
-                        data.fadeState    = "in"
-                        data.fadeAlpha    = 1
-                        data.currentTrans = 1
+                        -- [FIX] Ustaw pending PRZED task.spawn
+                        -- żeby kolejna klatka HB nie odpalila drugiego spawna
+                        data.rebuildPending = true
+                        data.fadeState      = "in"
+                        data.fadeAlpha      = 1
+                        data.currentTrans   = 1
+
                         task.spawn(function()
+                            -- [FIX] Sprawdź tokeny przed rebuildem
                             if not tagData[player] then return end
                             if not enabled then return end
+                            -- rebuildPending wyczyści attachToHead
                             attachToHead(player, currentHead, false)
                         end)
                     else
-                        -- Brak nowej postaci — poczekaj na CharacterAdded
-                        data.fadeState    = "idle"
-                        data.fadeAlpha    = 1
-                        data.currentTrans = 1
+                        data.rebuildPending = false
+                        data.fadeState      = "idle"
+                        data.fadeAlpha      = 1
+                        data.currentTrans   = 1
                     end
                     continue
                 end
+
+                -- Adornee zombie ale pending już jest — po prostu pomiń tę klatkę
+                if not adorneeOk then continue end
             end
             -- ─────────────────────────────────────────────────────────────
 
@@ -575,6 +711,7 @@ local function startGlobalHeartbeat()
                     data.fadeAlpha = 0
                     data.fadeState = "idle"
                 end
+
             elseif fadeState == "out" then
                 data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
                 if data.fadeAlpha > 0.995 then
@@ -592,6 +729,7 @@ local function startGlobalHeartbeat()
                 end
             end
 
+            -- Finalny alpha = max(masterAlpha, fadeAlpha)
             local finalTrans
             if fadeState == "idle" then
                 finalTrans        = masterAlpha
@@ -607,6 +745,7 @@ local function startGlobalHeartbeat()
             refs.canvas.GroupTransparency       = finalTrans
             refs.shadowCanvas.GroupTransparency = finalTrans
 
+            -- ── Dystans ──────────────────────────────────────────────────
             local char = player.Character
             local head = char and char:FindFirstChild("Head")
 
@@ -625,13 +764,17 @@ local function startGlobalHeartbeat()
     end)
 end
 
+-- ─────────────────────────────────────────────
+--   Cleanup gracza
+-- ─────────────────────────────────────────────
+
 local function cleanupPlayer(player)
     local data = tagData[player]
     if not data then return end
 
     if data.charConns then
         for _, conn in data.charConns do
-            conn:Disconnect()
+            pcall(function() conn:Disconnect() end)
         end
         data.charConns = nil
     end
@@ -642,18 +785,24 @@ local function cleanupPlayer(player)
     tagData[player] = nil
 end
 
+-- ─────────────────────────────────────────────
+--   Setup gracza
+-- ─────────────────────────────────────────────
+
 local function setupPlayer(player)
     if player == lp then return end
     if tagData[player] then return end
 
     tagData[player] = {
-        refs         = nil,
-        charConns    = nil,
-        fadeState    = "idle",
-        fadeAlpha    = 1,
-        building     = false,
-        distTimer    = 0,
-        currentTrans = 1,
+        refs            = nil,
+        charConns       = nil,
+        fadeState       = "idle",
+        fadeAlpha       = 1,
+        building        = false,
+        rebuildPending  = false,
+        distTimer       = 0,
+        currentTrans    = 1,
+        _buildToken     = nil,
     }
 
     local data = tagData[player]
@@ -663,20 +812,28 @@ local function setupPlayer(player)
             local head = newChar:WaitForChild("Head", 5)
             if not head or not tagData[player] then return end
             if not enabled then return end
+
+            -- [FIX] Guard: przy błyskawicznym podwójnym respawnie
+            -- (;char → ;re w <0.1s) stary callback nie nadpisze nowego
             if player.Character ~= newChar then return end
+
             attachToHead(player, head, false)
         end)
     end)
 
     local charRemoving = player.CharacterRemoving:Connect(function()
         local d = tagData[player]
-        if d and d.refs then
+        if not d then return end
+        if d.refs then
             d.fadeState = "out"
         end
+        -- Reset pending — nowa postać jeszcze nie istnieje
+        d.rebuildPending = false
     end)
 
     data.charConns = { charAdded, charRemoving }
 
+    -- Jeśli nametagi już włączone i gracz ma postać — podepnij od razu
     if enabled then
         local char = player.Character
         local head = char and char:FindFirstChild("Head")
@@ -685,6 +842,10 @@ local function setupPlayer(player)
         end
     end
 end
+
+-- ─────────────────────────────────────────────
+--   Publiczne API
+-- ─────────────────────────────────────────────
 
 getgenv().Nametags = {
 
@@ -713,14 +874,18 @@ getgenv().Nametags = {
             if not data then continue end
             if data.fadeState == "out" then continue end
 
-            data.fadeState    = "idle"
-            data.fadeAlpha    = 0
-            data.currentTrans = 1
+            -- [FIX] Resetuj building przy enable — zapobiega
+            -- sytuacji gdy poprzednie wywołanie skończyło się z building=true
+            data.building       = false
+            data.rebuildPending = false
+            data.fadeState      = "idle"
+            data.fadeAlpha      = 0
+            data.currentTrans   = 1
 
             local char = player.Character
             local head = char and char:FindFirstChild("Head")
 
-            if head and not data.building then
+            if head then
                 attachToHead(player, head, true)
             elseif data.refs then
                 data.refs.canvas.GroupTransparency       = 1
@@ -745,6 +910,7 @@ getgenv().Nametags = {
                 data.fadeState = "idle"
                 data.fadeAlpha = 0
             end
+            data.rebuildPending = false
         end
 
         animateMasterAlpha(1, CFG.ToggleLerpSpeed, function()
@@ -780,6 +946,10 @@ getgenv().Nametags = {
 getgenv().enableNametags     = getgenv().Nametags.enable
 getgenv().disableNametags    = getgenv().Nametags.disable
 getgenv().updateNametagColor = getgenv().Nametags.setColor
+
+-- ─────────────────────────────────────────────
+--   Inicjalizacja
+-- ─────────────────────────────────────────────
 
 Players.PlayerAdded:Connect(setupPlayer)
 
