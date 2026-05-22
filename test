@@ -1,5 +1,7 @@
 -- =============================================
---       NAMETAG SYSTEM v19.1 - HD Admin Fix
+--       NAMETAG SYSTEM v19.2 - HD Admin Fix
+--       Fixes: zombie adornee po ;char/:re/
+--       :wormify, tag w powietrzu, sync toggle
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -67,7 +69,6 @@ local avatarCache     = {}
 local widthCache      = {}
 local tagData         = {}
 
--- Eksport do getgenv dla zewnętrznych skryptów
 getgenv().tagData = tagData
 
 local tagContainer = CoreGui:FindFirstChild("NametagContainer_v19")
@@ -149,11 +150,6 @@ local function buildUI(player, head)
     local textWidth  = totalWidth - textOffset - CFG.WidthPadR
     local refs       = {}
     local cr         = CFG.CornerRadius
-
-    local tY_Name = CFG.TextOffsetY_Name
-    local tY_User = CFG.TextOffsetY_User
-    local tY_Sep  = CFG.TextOffsetY_Sep
-    local tY_Dist = CFG.TextOffsetY_Dist
 
     local shadowBB = Instance.new("BillboardGui")
     shadowBB.Name             = "DNT_Shadow_" .. player.Name
@@ -301,7 +297,7 @@ local function buildUI(player, head)
     local dispLabel = Instance.new("TextLabel", glass)
     dispLabel.Text                   = player.DisplayName
     dispLabel.Size                   = UDim2.fromOffset(textWidth, 16)
-    dispLabel.Position               = UDim2.fromOffset(textOffset, tY_Name)
+    dispLabel.Position               = UDim2.fromOffset(textOffset, CFG.TextOffsetY_Name)
     dispLabel.Font                   = CFG.FontMain
     dispLabel.TextColor3             = CFG.TextMain
     dispLabel.TextSize               = 11
@@ -313,7 +309,7 @@ local function buildUI(player, head)
     local userLabel = Instance.new("TextLabel", glass)
     userLabel.Text                   = "@" .. player.Name
     userLabel.Size                   = UDim2.fromOffset(textWidth, 12)
-    userLabel.Position               = UDim2.fromOffset(textOffset, tY_User)
+    userLabel.Position               = UDim2.fromOffset(textOffset, CFG.TextOffsetY_User)
     userLabel.Font                   = CFG.FontSub
     userLabel.TextColor3             = CFG.TextSub
     userLabel.TextSize               = 9
@@ -324,7 +320,7 @@ local function buildUI(player, head)
 
     local sep = Instance.new("Frame", glass)
     sep.Size                   = UDim2.new(0, textWidth, 0, 1)
-    sep.Position               = UDim2.fromOffset(textOffset, tY_Sep)
+    sep.Position               = UDim2.fromOffset(textOffset, CFG.TextOffsetY_Sep)
     sep.BackgroundColor3       = CFG.SepColor
     sep.BackgroundTransparency = 0
     sep.BorderSizePixel        = 0
@@ -338,7 +334,7 @@ local function buildUI(player, head)
     local distDot = Instance.new("TextLabel", glass)
     distDot.Text                   = "●"
     distDot.Size                   = UDim2.fromOffset(10, 11)
-    distDot.Position               = UDim2.fromOffset(textOffset, tY_Dist)
+    distDot.Position               = UDim2.fromOffset(textOffset, CFG.TextOffsetY_Dist)
     distDot.Font                   = CFG.FontMeta
     distDot.TextColor3             = CFG.ColorClose
     distDot.TextSize               = 7
@@ -351,7 +347,7 @@ local function buildUI(player, head)
     local distLabel = Instance.new("TextLabel", glass)
     distLabel.Text                   = ""
     distLabel.Size                   = UDim2.fromOffset(textWidth - 12, 11)
-    distLabel.Position               = UDim2.fromOffset(textOffset + 11, tY_Dist)
+    distLabel.Position               = UDim2.fromOffset(textOffset + 11, CFG.TextOffsetY_Dist)
     distLabel.Font                   = CFG.FontMeta
     distLabel.TextColor3             = CFG.TextMeta
     distLabel.TextSize               = 8
@@ -418,14 +414,8 @@ local function attachToHead(player, head, toggleBuild)
     if not head or not head.Parent then return end
     if data.building then return end
 
-    -- ── FIX HD ADMIN ─────────────────────────────────────────────────────────
-    -- Jeśli trwa fade-out (z poprzedniego CharacterRemoving), anulujemy go
-    -- i natychmiast niszczymy stary UI przed budową nowego.
-    -- Bez tego: CharacterAdded odpala się w tej samej klatce co CharacterRemoving
-    -- (HD Admin robi natychmiastowy respawn) i guard "fadeState == out" blokuje
-    -- budowę taga na nowej postaci.
+    -- Anuluj ongoing fade-out (HD Admin natychmiastowy respawn)
     if data.fadeState == "out" then
-        -- Zniszcz stary UI od razu (już znika, użytkownik tego nie zobaczy)
         if data.refs then
             if data.refs.billboard and data.refs.billboard.Parent then
                 pcall(function() data.refs.billboard:Destroy() end)
@@ -439,16 +429,34 @@ local function attachToHead(player, head, toggleBuild)
         data.fadeAlpha    = 1
         data.currentTrans = 1
     end
-    -- ─────────────────────────────────────────────────────────────────────────
 
+    -- Billboard już istnieje i Adornee jest żywy — tylko aktualizuj
     if data.refs and data.refs.billboard and data.refs.billboard.Parent then
-        if data.refs.billboard.Adornee ~= head then
-            data.refs.billboard.Adornee = head
-            if data.refs.shadowBB then
-                data.refs.shadowBB.Adornee = head
-            end
+        local adornee = data.refs.billboard.Adornee
+        local adorneeOk = false
+        if adornee then
+            local ok, par = pcall(function() return adornee.Parent end)
+            adorneeOk = ok and par ~= nil
         end
-        return
+
+        if adorneeOk then
+            if data.refs.billboard.Adornee ~= head then
+                data.refs.billboard.Adornee = head
+                if data.refs.shadowBB then
+                    data.refs.shadowBB.Adornee = head
+                end
+            end
+            return
+        end
+
+        -- Adornee martwy — zniszcz i przebuduj
+        if data.refs.billboard and data.refs.billboard.Parent then
+            pcall(function() data.refs.billboard:Destroy() end)
+        end
+        if data.refs.shadowBB and data.refs.shadowBB.Parent then
+            pcall(function() data.refs.shadowBB:Destroy() end)
+        end
+        data.refs = nil
     end
 
     data.building = true
@@ -511,6 +519,54 @@ local function startGlobalHeartbeat()
                 continue
             end
 
+            -- ── Zombie adornee detection ──────────────────────────────────
+            -- Billboard żyje w kontenerze ale Adornee to zniszczony Head
+            -- (po ;char / ;re / ;wormify / ;spongify itd.)
+            -- Roblox ukrywa BillboardGui gdy Adornee.Parent == nil
+            -- → tag "znika" lub "wisi w powietrzu" w ostatniej pozycji
+            do
+                local adornee = refs.billboard.Adornee
+                local adorneeOk = false
+                if adornee then
+                    local ok2, par = pcall(function() return adornee.Parent end)
+                    adorneeOk = ok2 and par ~= nil
+                end
+
+                if not adorneeOk then
+                    local char        = player.Character
+                    local currentHead = char and char:FindFirstChild("Head")
+
+                    -- Zniszcz zombie billboard
+                    if refs.billboard and refs.billboard.Parent then
+                        pcall(function() refs.billboard:Destroy() end)
+                    end
+                    if refs.shadowBB and refs.shadowBB.Parent then
+                        pcall(function() refs.shadowBB:Destroy() end)
+                    end
+                    data.refs     = nil
+                    data.building = false
+
+                    if currentHead and enabled then
+                        -- Nowa postać gotowa — przebuduj tag
+                        data.fadeState    = "in"
+                        data.fadeAlpha    = 1
+                        data.currentTrans = 1
+                        task.spawn(function()
+                            if not tagData[player] then return end
+                            if not enabled then return end
+                            attachToHead(player, currentHead, false)
+                        end)
+                    else
+                        -- Brak nowej postaci — poczekaj na CharacterAdded
+                        data.fadeState    = "idle"
+                        data.fadeAlpha    = 1
+                        data.currentTrans = 1
+                    end
+                    continue
+                end
+            end
+            -- ─────────────────────────────────────────────────────────────
+
             local fadeState = data.fadeState
 
             if fadeState == "in" then
@@ -519,7 +575,6 @@ local function startGlobalHeartbeat()
                     data.fadeAlpha = 0
                     data.fadeState = "idle"
                 end
-
             elseif fadeState == "out" then
                 data.fadeAlpha = data.fadeAlpha + (1 - data.fadeAlpha) * (1 - exp(-CFG.PlayerFadeOutSpeed * dt))
                 if data.fadeAlpha > 0.995 then
@@ -538,7 +593,6 @@ local function startGlobalHeartbeat()
             end
 
             local finalTrans
-
             if fadeState == "idle" then
                 finalTrans        = masterAlpha
                 data.currentTrans = finalTrans
@@ -606,19 +660,10 @@ local function setupPlayer(player)
 
     local charAdded = player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
-            -- ── FIX HD ADMIN ──────────────────────────────────────────────────
-            -- WaitForChild może tutaj poczekać na głowę która jeszcze nie istnieje
-            -- po szybkim respawnie. Czekamy maksymalnie 5s.
             local head = newChar:WaitForChild("Head", 5)
             if not head or not tagData[player] then return end
             if not enabled then return end
-
-            -- Dodatkowe sprawdzenie: czy ta postać to wciąż aktualna postać gracza?
-            -- Przy błyskawicznym podwójnym respawnie (;char → ;re w <0.1s)
-            -- może wylecieć przestarzały callback ze starą newChar.
             if player.Character ~= newChar then return end
-            -- ─────────────────────────────────────────────────────────────────
-
             attachToHead(player, head, false)
         end)
     end)
