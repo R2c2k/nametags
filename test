@@ -16,6 +16,8 @@
 --        w tej samej klatce)
 --  [FIX] Heartbeat zombie detection nie może się wyścigować
 --        z trwającym buildem — sprawdza generation przed spawnem
+--  [FIX v19.4.1] CanvasGroup sub-pixel blur przy GroupTransparency
+--        bliskim 0 — snap do dokładnego 0/1 przy progu 0.008
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -123,6 +125,12 @@ local format = string.format
 --   Pomocnicze
 -- ─────────────────────────────────────────────
 
+local function snapTrans(v)
+    if v < 0.008 then return 0 end
+    if v > 0.992 then return 1 end
+    return v
+end
+
 local function lerpColor(c1, c2, t)
     return Color3.new(
         c1.R + (c2.R - c1.R) * t,
@@ -161,7 +169,6 @@ local function accentGradientColor(color)
     })
 end
 
--- Sprawdzenie żywości obiektu bez pcall
 local function isAlive(instance)
     if not instance then return false end
     return instance.Parent ~= nil
@@ -328,9 +335,6 @@ local function buildUI(player, head)
     avatarPlaceholderGrad.Rotation = 135
 
     local userId = player.UserId
-    -- [FIX] Generation token — każdy buildUI dostaje unikalny token.
-    -- Avatar fetch sprawdza token przed zapisem — zapobiega
-    -- nadpisaniu obrazka przez przestarzały fetch przy szybkich zmianach.
     local buildGen = tagData[player] and tagData[player]._gen or 0
 
     if avatarCache[userId] then
@@ -347,7 +351,6 @@ local function buildUI(player, head)
             )
             if not ok or not img then return end
             if not isAlive(avatarLabel) then return end
-            -- Sprawdź czy generacja wciąż aktualna
             local d = tagData[player]
             if not d or d._gen ~= buildGen then return end
 
@@ -435,7 +438,7 @@ local function animateMasterAlpha(targetAlpha, speed, onDone)
         masterAlphaConn = nil
     end
 
-    if abs(masterAlpha - targetAlpha) < 0.002 then
+    if abs(masterAlpha - targetAlpha) < 0.001 then
         masterAlpha = targetAlpha
         if onDone then onDone() end
         return
@@ -443,7 +446,7 @@ local function animateMasterAlpha(targetAlpha, speed, onDone)
 
     masterAlphaConn = RunService.Heartbeat:Connect(function(dt)
         local diff = targetAlpha - masterAlpha
-        if abs(diff) < 0.002 then
+        if abs(diff) < 0.001 then
             masterAlpha = targetAlpha
             masterAlphaConn:Disconnect()
             masterAlphaConn = nil
@@ -488,13 +491,6 @@ end
 
 -- ─────────────────────────────────────────────
 --   Podpięcie taga do głowy
---
---  [FIX v19.4] Używa generation counter zamiast
---  boolean building. Każde nowe żądanie budowy
---  inkrementuje _gen — poprzedni build widzi że
---  jego generacja jest przestarzała i się nie zapisuje.
---  Dzięki temu szybkie ;char A → ;char B nie blokuje się
---  nawzajem przez building=true.
 -- ─────────────────────────────────────────────
 
 local function attachToHead(player, head, toggleBuild)
@@ -502,7 +498,6 @@ local function attachToHead(player, head, toggleBuild)
     if not data or not enabled then return end
     if not head or not isAlive(head) then return end
 
-    -- Anuluj ongoing fade-out (HD Admin natychmiastowy respawn)
     if data.fadeState == "out" then
         destroyRefs(data)
         data.fadeState      = "idle"
@@ -511,7 +506,6 @@ local function attachToHead(player, head, toggleBuild)
         data.rebuildPending = false
     end
 
-    -- Billboard już istnieje — sprawdź czy Adornee żyje
     if data.refs and data.refs.billboard and data.refs.billboard.Parent then
         local adornee   = data.refs.billboard.Adornee
         local adorneeOk = isAlive(adornee)
@@ -527,12 +521,9 @@ local function attachToHead(player, head, toggleBuild)
             return
         end
 
-        -- Adornee martwy — zniszcz
         destroyRefs(data)
     end
 
-    -- [FIX] Inkrementuj generację — anuluje wszystkie poprzednie
-    -- task.spawny które czekają na buildUI tej postaci
     data._gen = (data._gen or 0) + 1
     local myGen = data._gen
 
@@ -551,35 +542,23 @@ local function attachToHead(player, head, toggleBuild)
 
     local initTrans = data.currentTrans
 
-    -- Uruchom build w osobnym task.spawn żeby nie blokować callera
-    -- (CharacterAdded callback, Heartbeat zombie detection)
     task.spawn(function()
-        -- Sprawdź czy ta generacja wciąż aktualna
         local d = tagData[player]
-        if not d or d._gen ~= myGen then
-            -- Przestarzała generacja — nowy build już jest w drodze
-            return
-        end
+        if not d or d._gen ~= myGen then return end
         if not enabled then
             d.building = false
             return
         end
         if not isAlive(head) then
             d.building = false
-            -- Head zniknął zanim zdążyliśmy zbudować —
-            -- CharacterAdded dla nowej postaci zadba o rebuild
             return
         end
 
         local ok, err = pcall(function()
             local refs = buildUI(player, head)
 
-            -- Ostatnia weryfikacja generacji przed zapisem
-            -- (buildUI może trwać kilka ms, przez ten czas mogła
-            -- przyjść kolejna zmiana postaci)
             local d2 = tagData[player]
             if not d2 or d2._gen ~= myGen then
-                -- Przestarzałe — zniszcz właśnie zbudowane UI
                 if refs.billboard and refs.billboard.Parent then
                     pcall(function() refs.billboard:Destroy() end)
                 end
@@ -589,8 +568,9 @@ local function attachToHead(player, head, toggleBuild)
                 return
             end
 
-            refs.canvas.GroupTransparency       = initTrans
-            refs.shadowCanvas.GroupTransparency = initTrans
+            local snappedInit = snapTrans(initTrans)
+            refs.canvas.GroupTransparency       = snappedInit
+            refs.shadowCanvas.GroupTransparency = snappedInit
             d2.refs     = refs
             d2.building = false
         end)
@@ -635,10 +615,6 @@ local function startGlobalHeartbeat()
 
         for player, data in tagData do
             if not data.refs then
-                -- [FIX] DEAD STATE recovery:
-                -- refs=nil + building=false + gracz ma Head + nametagi włączone
-                -- = tag zniknął na stałe i nic go nie odbudowuje
-                -- Heartbeat sam zainicjuje rebuild zamiast czekać na event
                 if not data.building and not data.rebuildPending
                     and data.fadeState == "idle" and enabled
                 then
@@ -673,7 +649,6 @@ local function startGlobalHeartbeat()
                 continue
             end
 
-            -- Zombie adornee detection
             do
                 local adornee   = refs.billboard.Adornee
                 local adorneeOk = isAlive(adornee)
@@ -699,8 +674,6 @@ local function startGlobalHeartbeat()
                                 if d then d.rebuildPending = false end
                                 return
                             end
-                            -- Jeśli generacja się zmieniła to znaczy że
-                            -- attachToHead już był wywołany z zewnątrz
                             if d._gen ~= capturedGen then
                                 d.rebuildPending = false
                                 return
@@ -741,12 +714,13 @@ local function startGlobalHeartbeat()
 
             local finalTrans
             if fadeState == "idle" then
-                finalTrans        = masterAlpha
+                finalTrans        = snapTrans(masterAlpha)
                 data.currentTrans = finalTrans
             else
                 local targetTrans = max(masterAlpha, data.fadeAlpha)
                 local cur         = data.currentTrans
                 cur               = cur + (targetTrans - cur) * (1 - exp(-CFG.LerpSpeed * dt))
+                cur               = snapTrans(cur)
                 data.currentTrans = cur
                 finalTrans        = cur
             end
@@ -818,30 +792,22 @@ local function setupPlayer(player)
 
     local charAdded = player.CharacterAdded:Connect(function(newChar)
         task.spawn(function()
-            -- Inkrementuj generację natychmiast przy nowym CharacterAdded
-            -- żeby poprzedni build (jeśli trwał) wiedział że jest przestarzały
             local d = tagData[player]
             if not d then return end
 
-            -- Zresetuj flagi — nowa postać w drodze
             d.building       = false
             d.rebuildPending = false
             d.fadeState      = "idle"
             d.fadeAlpha      = 1
             d.currentTrans   = 1
-            -- Nie inkrementujemy _gen tutaj — zrobi to attachToHead
 
             local head = newChar:WaitForChild("Head", 5)
             if not head then return end
 
-            -- Sprawdź czy ta postać wciąż aktualna
-            -- Używamy generacji zamiast player.Character porównania
-            -- bo player.Character może być jeszcze nieaktualne
             local d2 = tagData[player]
             if not d2 then return end
             if not enabled then return end
 
-            -- Dodatkowy guard: czy Head jest z aktualnej postaci?
             if not isAlive(head) then return end
             if head.Parent ~= newChar then return end
             if not isAlive(newChar) then return end
@@ -853,14 +819,10 @@ local function setupPlayer(player)
     local charRemoving = player.CharacterRemoving:Connect(function()
         local d = tagData[player]
         if not d then return end
-        -- Zacznij fade-out istniejącego taga
         if d.refs then
             d.fadeState = "out"
         end
-        -- Reset pending — nowa postać jeszcze nie istnieje
         d.rebuildPending = false
-        -- Nie resetujemy building — attachToHead w task.spawn sam się
-        -- zatrzyma przez generation check
     end)
 
     data.charConns = { charAdded, charRemoving }
@@ -905,8 +867,6 @@ getgenv().Nametags = {
             if not data then continue end
             if data.fadeState == "out" then continue end
 
-            -- [FIX] Pełny reset przy enable — zapobiega
-            -- "zamrożonym" flagom z poprzedniej sesji
             data.building       = false
             data.rebuildPending = false
             data.fadeState      = "idle"
