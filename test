@@ -1,23 +1,16 @@
 -- =============================================
---       NAMETAG SYSTEM v19.4
+--       NAMETAG SYSTEM v19.5
 --
---  Zmiany względem v19.3:
---  [FIX] DEAD STATE przy enable() — gracz z postacią
---        ale bez taga (np. crystalwer71 case):
---        enable() teraz wymusza attachToHead nawet gdy
---        data.refs == nil i building == false
---  [FIX] Race condition przy bardzo szybkich zmianach:
---        building guard zastąpiony przez generation counter —
---        nowy build zawsze anuluje poprzedni zamiast blokować
---  [FIX] CharacterAdded który przyszedł po kolejnym
---        CharacterRemoving (przestarzały callback) teraz
---        jest odrzucany przez generację, nie przez
---        player.Character == newChar (które może być nieaktualne
---        w tej samej klatce)
---  [FIX] Heartbeat zombie detection nie może się wyścigować
---        z trwającym buildem — sprawdza generation przed spawnem
---  [FIX v19.4.1] CanvasGroup sub-pixel blur przy GroupTransparency
---        bliskim 0 — snap do dokładnego 0/1 przy progu 0.008
+--  Zmiany względem v19.4:
+--  [FIX v19.5.1] Tagi budowane podczas animacji toggle
+--        startują zawsze z initTrans = 1 (niewidoczne),
+--        Heartbeat płynnie doprowadza do aktualnego
+--        masterAlpha przez snapTrans — żaden tag nie
+--        dostaje już losowego initTrans w środku animacji
+--  [FIX v19.5.2] Po zakończeniu animateMasterAlpha do 0,
+--        wymuszamy dokładne 0 na wszystkich tagach idle —
+--        eliminuje resztkowe wartości 0.002-0.007 które
+--        snapTrans przy 0.008 mógł przepuścić
 -- =============================================
 
 local Players     = game:GetService("Players")
@@ -530,17 +523,18 @@ local function attachToHead(player, head, toggleBuild)
     data.building       = true
     data.rebuildPending = false
 
+    -- [v19.5] Zawsze startuj od 1 (niewidoczny) niezależnie od toggleBuild.
+    -- Heartbeat sam dolerpuje do aktualnego masterAlpha przez snapTrans.
+    -- Dzięki temu żaden tag nie dostaje losowego initTrans w środku animacji.
     if toggleBuild then
         data.fadeState    = "idle"
         data.fadeAlpha    = 0
-        data.currentTrans = masterAlpha
+        data.currentTrans = 1
     else
         data.fadeState    = "in"
         data.fadeAlpha    = 1
         data.currentTrans = 1
     end
-
-    local initTrans = data.currentTrans
 
     task.spawn(function()
         local d = tagData[player]
@@ -568,9 +562,9 @@ local function attachToHead(player, head, toggleBuild)
                 return
             end
 
-            local snappedInit = snapTrans(initTrans)
-            refs.canvas.GroupTransparency       = snappedInit
-            refs.shadowCanvas.GroupTransparency = snappedInit
+            -- [v19.5] initTrans zawsze 1 — Heartbeat dolerpuje
+            refs.canvas.GroupTransparency       = 1
+            refs.shadowCanvas.GroupTransparency = 1
             d2.refs     = refs
             d2.building = false
         end)
@@ -885,8 +879,17 @@ getgenv().Nametags = {
             end
         end
 
+        -- [v19.5] Po zakończeniu animacji wymuszamy dokładne 0
+        -- na wszystkich tagach idle — eliminuje resztki po lerp
         animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
             isTransitioning = false
+            for _, data in tagData do
+                if data.refs and data.fadeState == "idle" then
+                    data.currentTrans = 0
+                    data.refs.canvas.GroupTransparency       = 0
+                    data.refs.shadowCanvas.GroupTransparency = 0
+                end
+            end
         end)
     end,
 
