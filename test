@@ -4,9 +4,9 @@
 --  Zmiany względem v19.5:
 --  [NEW v19.6] Proximity fade — nametag zanika
 --        gdy kamera zbliża się do głowy gracza.
---        Poniżej ProximityFadeNear (35 studs):
+--        Poniżej ProximityFadeNear (25 studs):
 --        kompletnie niewidoczny. Powyżej
---        ProximityFadeFar (45 studs): pełna
+--        ProximityFadeFar (35 studs): pełna
 --        widoczność. Między nimi: płynny lerp.
 --        Trzecia warstwa przezroczystości obok
 --        masterAlpha i fadeAlpha — łączona przez
@@ -75,8 +75,8 @@ local CFG = {
     DistThrottle = 0.16,
 
     -- [v19.6] Proximity fade
-    ProximityFadeNear = 35,   -- poniżej tej odległości (kamera→głowa): całkowicie niewidoczny
-    ProximityFadeFar  = 45,   -- powyżej tej odległości: w pełni widoczny
+    ProximityFadeNear = 25,   -- poniżej tej odległości (kamera→głowa): całkowicie niewidoczny
+    ProximityFadeFar  = 35,   -- powyżej tej odległości: w pełni widoczny
 }
 
 -- ─────────────────────────────────────────────
@@ -530,6 +530,7 @@ local function attachToHead(player, head, toggleBuild)
     data.building       = true
     data.rebuildPending = false
 
+    -- [v19.5] Zawsze startuj od 1 (niewidoczny) niezależnie od toggleBuild.
     if toggleBuild then
         data.fadeState    = "idle"
         data.fadeAlpha    = 0
@@ -610,6 +611,7 @@ local function startGlobalHeartbeat()
     globalHeartbeat = RunService.Heartbeat:Connect(function(dt)
         local lpRoot = cachedLpRoot
 
+        -- [v19.6] Pobierz pozycję kamery raz na cały frame
         local cam    = workspace.CurrentCamera
         local camPos = cam and cam.CFrame.Position or nil
 
@@ -702,6 +704,7 @@ local function startGlobalHeartbeat()
                     local dist = (adornee.Position - camPos).Magnitude
                     local near = CFG.ProximityFadeNear
                     local far  = CFG.ProximityFadeFar
+                    -- 1 = niewidoczny (blisko), 0 = widoczny (daleko)
                     data.proximityAlpha = 1 - clamp((dist - near) / (far - near), 0, 1)
                 else
                     data.proximityAlpha = 0
@@ -727,6 +730,12 @@ local function startGlobalHeartbeat()
                 end
             end
 
+            -- ─────────────────────────────────────────
+            -- [v19.6] finalTrans = max wszystkich warstw
+            --   masterAlpha    — globalny toggle
+            --   fadeAlpha      — per-gracz spawn/despawn
+            --   proximityAlpha — proximity fade (kamera)
+            -- ─────────────────────────────────────────
             local finalTrans
             if fadeState == "idle" then
                 finalTrans        = snapTrans(max(masterAlpha, data.proximityAlpha))
@@ -801,7 +810,7 @@ local function setupPlayer(player)
         distTimer       = 0,
         currentTrans    = 1,
         _gen            = 0,
-        proximityAlpha  = 0,
+        proximityAlpha  = 0,   -- [v19.6] domyślnie widoczny
     }
 
     local data = tagData[player]
@@ -901,10 +910,14 @@ getgenv().Nametags = {
             end
         end
 
+        -- [v19.5] Po zakończeniu animacji wymuszamy dokładne 0
+        -- na wszystkich tagach idle — eliminuje resztki po lerp
         animateMasterAlpha(0, CFG.ToggleLerpSpeed, function()
             isTransitioning = false
             for _, data in tagData do
                 if data.refs and data.fadeState == "idle" then
+                    -- [v19.6] Respektuj proximityAlpha — nie nadpisuj jeśli tag
+                    -- powinien być ukryty przez proximity fade
                     if data.proximityAlpha < 0.008 then
                         data.currentTrans = 0
                         data.refs.canvas.GroupTransparency       = 0
@@ -957,6 +970,7 @@ getgenv().Nametags = {
         end
     end,
 
+    -- [v19.6] Opcjonalne API do zmiany progów proximity w runtime
     setProximityRange = function(near, far)
         CFG.ProximityFadeNear = near
         CFG.ProximityFadeFar  = far
@@ -966,10 +980,7 @@ getgenv().Nametags = {
 getgenv().enableNametags        = getgenv().Nametags.enable
 getgenv().disableNametags       = getgenv().Nametags.disable
 getgenv().updateNametagColor    = getgenv().Nametags.setColor
-getgenv().setProximityRange     = getgenv().Nametags.setProximityRange
-
--- [v19.6] Eksport stanu enabled dla innych modułów (np. AntiStaff ESP offset)
-getgenv().nametagsEnabled = function() return enabled end
+getgenv().setProximityRange     = getgenv().Nametags.setProximityRange  -- [v19.6]
 
 -- ─────────────────────────────────────────────
 --   Inicjalizacja
